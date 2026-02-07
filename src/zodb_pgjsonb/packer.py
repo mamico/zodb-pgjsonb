@@ -7,6 +7,8 @@ server-side recursive CTE query. No data leaves PostgreSQL during pack.
 
 import logging
 
+from ZODB.utils import u64
+
 logger = logging.getLogger(__name__)
 
 # Reachability query: find all objects reachable from root (zoid=0)
@@ -22,12 +24,14 @@ SELECT zoid FROM reachable
 """
 
 
-def pack(conn, pack_time=None):
+def pack(conn, pack_time=None, history_preserving=False):
     """Remove unreachable objects and their blobs.
 
     Args:
         conn: psycopg connection
-        pack_time: unused for now (history-free mode doesn't need it)
+        pack_time: pack_time bytes (TID) — used in history-preserving mode
+            to remove old revisions before this point
+        history_preserving: if True, also clean up history tables
 
     Returns:
         Tuple of (deleted_objects, deleted_blobs, s3_keys_to_delete)
@@ -36,7 +40,10 @@ def pack(conn, pack_time=None):
 
     with conn.cursor() as cur:
         # Phase 1: Find reachable objects
-        cur.execute(f"SELECT zoid INTO TEMP reachable_oids FROM ({REACHABLE_QUERY}) q")
+        cur.execute(
+            f"SELECT zoid INTO TEMP reachable_oids "
+            f"FROM ({REACHABLE_QUERY}) q"
+        )
         cur.execute("CREATE INDEX ON reachable_oids (zoid)")
 
         # Phase 2: Delete unreachable objects
@@ -57,15 +64,75 @@ def pack(conn, pack_time=None):
             if row[0]:
                 s3_keys.append(row[0])
 
+        # Phase 4: History cleanup (history-preserving mode only)
+        deleted_history = 0
+        deleted_blob_history = 0
+        if history_preserving:
+            # Delete all history for unreachable objects
+            cur.execute(
+                "DELETE FROM object_history "
+                "WHERE zoid NOT IN (SELECT zoid FROM reachable_oids)"
+            )
+            deleted_history += cur.rowcount
+
+            cur.execute(
+                "DELETE FROM blob_history "
+                "WHERE zoid NOT IN (SELECT zoid FROM reachable_oids) "
+                "RETURNING s3_key"
+            )
+            deleted_blob_history += cur.rowcount
+            for row in cur.fetchall():
+                if row[0]:
+                    s3_keys.append(row[0])
+
+            # If pack_time given, remove old revisions for reachable objects
+            if pack_time is not None:
+                pack_tid = u64(pack_time)
+                # For each reachable object, keep the most recent revision
+                # at or before pack_time, delete all older ones
+                cur.execute(
+                    "DELETE FROM object_history oh "
+                    "WHERE oh.tid < %s "
+                    "AND oh.zoid IN (SELECT zoid FROM reachable_oids) "
+                    "AND EXISTS ("
+                    "  SELECT 1 FROM object_history oh2 "
+                    "  WHERE oh2.zoid = oh.zoid "
+                    "  AND oh2.tid > oh.tid AND oh2.tid <= %s"
+                    ")",
+                    (pack_tid, pack_tid),
+                )
+                deleted_history += cur.rowcount
+
+                cur.execute(
+                    "DELETE FROM blob_history bh "
+                    "WHERE bh.tid < %s "
+                    "AND bh.zoid IN (SELECT zoid FROM reachable_oids) "
+                    "AND EXISTS ("
+                    "  SELECT 1 FROM blob_history bh2 "
+                    "  WHERE bh2.zoid = bh.zoid "
+                    "  AND bh2.tid > bh.tid AND bh2.tid <= %s"
+                    ") "
+                    "RETURNING s3_key",
+                    (pack_tid, pack_tid),
+                )
+                deleted_blob_history += cur.rowcount
+                for row in cur.fetchall():
+                    if row[0]:
+                        s3_keys.append(row[0])
+
         # Cleanup temp table
         cur.execute("DROP TABLE reachable_oids")
 
     conn.commit()
 
     logger.info(
-        "Pack complete: removed %d objects, %d blobs, %d S3 keys to clean",
+        "Pack complete: removed %d objects, %d blobs, "
+        "%d history rows, %d blob history rows, "
+        "%d S3 keys to clean",
         deleted_objects,
         deleted_blobs,
+        deleted_history,
+        deleted_blob_history,
         len(s3_keys),
     )
 

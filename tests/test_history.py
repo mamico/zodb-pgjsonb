@@ -1,0 +1,434 @@
+"""Phase 3: History-preserving mode + undo tests.
+
+Tests that PGJsonbStorage correctly implements history-preserving mode
+with dual writes, loadBefore from history table, history() with
+transaction metadata, IStorageUndoable (undo, undoLog, undoInfo),
+and history-aware pack.
+
+Requires PostgreSQL on localhost:5433.
+"""
+
+import time
+
+import pytest
+
+import transaction as txn
+
+import ZODB
+from ZODB.interfaces import IStorageUndoable
+from ZODB.utils import p64, u64, z64
+
+from persistent.mapping import PersistentMapping
+
+from zodb_pgjsonb.storage import PGJsonbStorage
+
+
+DSN = "dbname=zodb_test user=zodb password=zodb host=localhost port=5433"
+
+
+@pytest.fixture
+def hp_storage():
+    """Fresh PGJsonbStorage in history-preserving mode."""
+    import psycopg
+    conn = psycopg.connect(DSN)
+    with conn.cursor() as cur:
+        cur.execute(
+            "DROP TABLE IF EXISTS "
+            "pack_state, blob_history, object_history, "
+            "blob_state, object_state, transaction_log CASCADE"
+        )
+    conn.commit()
+    conn.close()
+
+    s = PGJsonbStorage(DSN, history_preserving=True)
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def hp_db(hp_storage):
+    """ZODB.DB using history-preserving storage."""
+    database = ZODB.DB(hp_storage)
+    yield database
+    database.close()
+
+
+class TestHistoryPreservingSchema:
+    """Test that history tables are created in HP mode."""
+
+    def test_schema_creates_history_tables(self, hp_storage):
+        import psycopg
+        from psycopg.rows import dict_row
+        pg_conn = psycopg.connect(DSN, row_factory=dict_row)
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT tablename FROM pg_tables "
+                "WHERE schemaname = 'public' "
+                "ORDER BY tablename"
+            )
+            tables = [r["tablename"] for r in cur.fetchall()]
+        pg_conn.close()
+
+        assert "object_history" in tables
+        assert "blob_history" in tables
+        assert "pack_state" in tables
+
+    def test_history_preserving_flag(self, hp_storage):
+        assert hp_storage._history_preserving is True
+
+    def test_instance_inherits_flag(self, hp_storage):
+        inst = hp_storage.new_instance()
+        assert inst._history_preserving is True
+        inst.release()
+
+
+class TestDualWrite:
+    """Test that stores write to both tables in HP mode."""
+
+    def test_store_writes_to_both_tables(self, hp_db):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        conn = hp_db.open()
+        root = conn.root()
+        root["title"] = "Test"
+        txn.commit()
+        conn.close()
+
+        pg_conn = psycopg.connect(DSN, row_factory=dict_row)
+        with pg_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM object_state")
+            state_count = cur.fetchone()["cnt"]
+            cur.execute("SELECT COUNT(*) AS cnt FROM object_history")
+            history_count = cur.fetchone()["cnt"]
+        pg_conn.close()
+
+        # Root was stored once (in the DB open() commit)
+        # then updated with title in a second commit
+        assert state_count >= 1
+        assert history_count >= 1
+
+    def test_multiple_revisions_in_history(self, hp_db):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        conn = hp_db.open()
+        root = conn.root()
+        root["counter"] = 1
+        txn.commit()
+
+        root["counter"] = 2
+        txn.commit()
+
+        root["counter"] = 3
+        txn.commit()
+        conn.close()
+
+        pg_conn = psycopg.connect(DSN, row_factory=dict_row)
+        with pg_conn.cursor() as cur:
+            # Root has 1 entry in object_state (current)
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM object_state WHERE zoid = 0"
+            )
+            assert cur.fetchone()["cnt"] == 1
+
+            # Root has multiple entries in object_history
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0"
+            )
+            assert cur.fetchone()["cnt"] >= 3
+        pg_conn.close()
+
+
+class TestLoadBefore:
+    """Test loadBefore with history-preserving mode."""
+
+    def test_loadBefore_returns_previous_revision(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["val"] = "first"
+        txn.commit()
+        tid1 = hp_storage.lastTransaction()
+
+        root["val"] = "second"
+        txn.commit()
+        tid2 = hp_storage.lastTransaction()
+        conn.close()
+
+        # Load state before tid2 → should get tid1's state
+        result = hp_storage.loadBefore(z64, tid2)
+        assert result is not None
+        data, start_tid, end_tid = result
+        assert start_tid == tid1
+        assert end_tid == tid2
+
+    def test_loadBefore_returns_none_before_creation(self, hp_db, hp_storage):
+        # The root is created at the first commit
+        first_tid = hp_storage.lastTransaction()
+        # loadBefore with a tid <= first_tid should return None
+        result = hp_storage.loadBefore(z64, first_tid)
+        assert result is None
+
+    def test_loadBefore_end_tid_none_for_current(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["val"] = "latest"
+        txn.commit()
+        tid = hp_storage.lastTransaction()
+        conn.close()
+
+        # loadBefore with a tid > latest should return latest
+        # We need a tid larger than current
+        future_tid = p64(u64(tid) + 1)
+        result = hp_storage.loadBefore(z64, future_tid)
+        assert result is not None
+        data, start_tid, end_tid = result
+        assert start_tid == tid
+        assert end_tid is None  # no newer revision
+
+
+class TestLoadSerial:
+    """Test loadSerial with history-preserving mode."""
+
+    def test_loadSerial_from_history(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["val"] = "first"
+        txn.commit()
+        tid1 = hp_storage.lastTransaction()
+
+        root["val"] = "second"
+        txn.commit()
+        conn.close()
+
+        # Load the old revision by tid1
+        import zodb_json_codec
+        data = hp_storage.loadSerial(z64, tid1)
+        record = zodb_json_codec.decode_zodb_record(data)
+        assert record["@s"]["data"]["val"] == "first"
+
+
+class TestHistory:
+    """Test history() returns metadata from transaction_log."""
+
+    def test_history_returns_metadata(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["title"] = "Test"
+        txn.get().setUser("admin")
+        txn.get().note("Initial setup")
+        txn.commit()
+        conn.close()
+
+        entries = hp_storage.history(z64, size=10)
+        assert len(entries) >= 1
+        # Latest entry should have our metadata
+        latest = entries[0]
+        assert "admin" in latest["user_name"]
+        assert latest["description"] == "Initial setup"
+
+    def test_history_multiple_revisions(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["v"] = 1
+        txn.commit()
+
+        root["v"] = 2
+        txn.commit()
+
+        root["v"] = 3
+        txn.commit()
+        conn.close()
+
+        entries = hp_storage.history(z64, size=10)
+        # Should have multiple entries (root creation + 3 updates)
+        assert len(entries) >= 3
+        # Entries should be in reverse chronological order
+        for i in range(len(entries) - 1):
+            assert entries[i]["tid"] > entries[i + 1]["tid"]
+
+
+class TestUndoInterface:
+    """Test IStorageUndoable implementation."""
+
+    def test_provides_istorageundoable(self, hp_storage):
+        assert IStorageUndoable.providedBy(hp_storage)
+
+    def test_supports_undo_true(self, hp_storage):
+        assert hp_storage.supportsUndo() is True
+
+    def test_supports_undo_false_history_free(self):
+        """History-free storage does not support undo."""
+        import psycopg
+        conn = psycopg.connect(DSN)
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TABLE IF EXISTS "
+                "pack_state, blob_history, object_history, "
+                "blob_state, object_state, transaction_log CASCADE"
+            )
+        conn.commit()
+        conn.close()
+
+        s = PGJsonbStorage(DSN, history_preserving=False)
+        try:
+            assert s.supportsUndo() is False
+        finally:
+            s.close()
+
+    def test_undo_log_returns_transactions(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.get().note("change 1")
+        txn.commit()
+
+        root["x"] = 2
+        txn.get().note("change 2")
+        txn.commit()
+        conn.close()
+
+        log = hp_storage.undoLog(0, -20)
+        assert len(log) >= 2
+        # Latest transaction first
+        assert log[0]["description"] == "change 2"
+        assert log[1]["description"] == "change 1"
+
+    def test_undo_log_with_filter(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.get().note("keep")
+        txn.commit()
+
+        root["x"] = 2
+        txn.get().note("skip")
+        txn.commit()
+        conn.close()
+
+        log = hp_storage.undoLog(
+            0, -20,
+            filter=lambda d: d["description"] == "keep"
+        )
+        assert all(d["description"] == "keep" for d in log)
+
+    def test_undo_info_works(self, hp_db, hp_storage):
+        """UndoLogCompatible mixin provides undoInfo()."""
+        conn = hp_db.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.commit()
+        conn.close()
+
+        info = hp_storage.undoInfo()
+        assert isinstance(info, list)
+        assert len(info) >= 1
+
+
+class TestUndo:
+    """Test undo() reverts objects to previous state."""
+
+    def test_undo_reverts_object(self, hp_db, hp_storage):
+        conn = hp_db.open()
+        root = conn.root()
+        root["val"] = "original"
+        txn.commit()
+
+        root["val"] = "modified"
+        txn.get().note("modify val")
+        txn.commit()
+        tid_to_undo = hp_storage.lastTransaction()
+        conn.close()
+
+        # Undo the modification via DB.undo()
+        # (goes through TransactionalUndo → instance.undo())
+        hp_db.undo(tid_to_undo)
+        txn.commit()
+
+        # Verify the value is back to original
+        conn = hp_db.open()
+        root = conn.root()
+        assert root["val"] == "original"
+        conn.close()
+
+
+class TestHistoryPack:
+    """Test pack with history-preserving mode."""
+
+    def test_pack_removes_old_history(self, hp_db, hp_storage):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        conn = hp_db.open()
+        root = conn.root()
+        root["v"] = 1
+        txn.commit()
+
+        root["v"] = 2
+        txn.commit()
+
+        root["v"] = 3
+        txn.commit()
+        conn.close()
+
+        # Count history rows before pack
+        pg_conn = psycopg.connect(DSN, row_factory=dict_row)
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0"
+            )
+            before = cur.fetchone()["cnt"]
+        pg_conn.close()
+
+        assert before >= 3
+
+        # Pack up to now
+        hp_storage.pack(time.time(), None)
+
+        # Some old history should be removed
+        pg_conn = psycopg.connect(DSN, row_factory=dict_row)
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0"
+            )
+            after = cur.fetchone()["cnt"]
+        pg_conn.close()
+
+        assert after < before
+
+    def test_pack_removes_unreachable_history(self, hp_db, hp_storage):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        conn = hp_db.open()
+        root = conn.root()
+        root["child"] = PersistentMapping()
+        root["child"]["name"] = "temp"
+        txn.commit()
+
+        # Remove the child — makes it unreachable
+        del root["child"]
+        txn.commit()
+        conn.close()
+
+        # Pack
+        hp_storage.pack(time.time(), None)
+
+        # Unreachable child's history should be cleaned up
+        pg_conn = psycopg.connect(DSN, row_factory=dict_row)
+        with pg_conn.cursor() as cur:
+            # The child object should not be in object_state
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM object_state WHERE zoid != 0"
+            )
+            orphan_state = cur.fetchone()["cnt"]
+            # The child should also be gone from object_history
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM object_history "
+                "WHERE zoid NOT IN (SELECT zoid FROM object_state)"
+            )
+            orphan_history = cur.fetchone()["cnt"]
+        pg_conn.close()
+
+        assert orphan_state == 0
+        assert orphan_history == 0

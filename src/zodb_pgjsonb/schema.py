@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS blob_history (
 
 CREATE INDEX IF NOT EXISTS idx_history_tid
     ON object_history (tid);
+CREATE INDEX IF NOT EXISTS idx_history_zoid_tid
+    ON object_history (zoid, tid DESC);
 
 CREATE TABLE IF NOT EXISTS pack_state (
     zoid        BIGINT PRIMARY KEY,
