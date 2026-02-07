@@ -281,6 +281,23 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             "refs": refs,
         })
 
+    def checkCurrentSerialInTransaction(self, oid, serial, transaction):
+        """Verify that the object's serial hasn't changed during this txn."""
+        if transaction is not self._transaction:
+            raise StorageTransactionError(self, transaction)
+        zoid = u64(oid)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT tid FROM object_state WHERE zoid = %s", (zoid,)
+            )
+            row = cur.fetchone()
+        if row is not None:
+            current_serial = p64(row["tid"])
+            if current_serial != serial:
+                raise ReadConflictError(
+                    oid=oid, serials=(current_serial, serial),
+                )
+
     # ── BaseStorage hooks (2PC) ──────────────────────────────────────
 
     def _begin(self, tid, u, d, e):
@@ -307,8 +324,38 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
 
         return self._resolved or None
 
+    def tpc_finish(self, transaction, f=None):
+        """Commit PG transaction, then run callback.
+
+        Overrides BaseStorage.tpc_finish to ensure the PG transaction is
+        committed and _ltid is updated BEFORE the callback fires.
+        BaseStorage calls f(tid) before _finish(), but our _finish() does
+        the PG COMMIT — so other threads would see stale data during the
+        callback.
+
+        The callback runs AFTER the lock is released so that concurrent
+        readers (lastTransaction, getTid) can proceed during the callback.
+        This is safe because commit + _ltid are already done.
+        """
+        with self._lock:
+            if transaction is not self._transaction:
+                raise StorageTransactionError(
+                    "tpc_finish called with wrong transaction")
+            try:
+                u, d, e = self._ude
+                self._finish(self._tid, u, d, e)
+            finally:
+                self._clear_temp()
+                self._ude = None
+                self._transaction = None
+                self._commit_lock.release()
+        tid = self._tid
+        if f is not None:
+            f(tid)
+        return tid
+
     def _finish(self, tid, u, d, e):
-        """Called by BaseStorage.tpc_finish — commit PG transaction."""
+        """Commit PG transaction and update _ltid."""
         self._conn.commit()
         self._ltid = tid
 
@@ -666,6 +713,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             main_storage._dsn, row_factory=dict_row, autocommit=True,
         )
         self._polled_tid = None  # None = never polled, int = last seen TID
+        self._in_read_txn = False  # True when inside REPEATABLE READ snapshot
         self._tmp = []
         self._blob_tmp = []  # pending blob stores: [(oid_int, blob_path), ...]
         self._tid = None
@@ -687,15 +735,47 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
     def release(self):
         """Close this instance's PG connection and clean up temp dir."""
         if self._conn and not self._conn.closed:
+            self._end_read_txn()
             self._conn.close()
         if os.path.exists(self._blob_temp_dir):
             shutil.rmtree(self._blob_temp_dir, ignore_errors=True)
+
+    def _end_read_txn(self):
+        """End the current REPEATABLE READ snapshot transaction, if any."""
+        if self._in_read_txn:
+            self._conn.execute("COMMIT")
+            self._in_read_txn = False
+
+    def _begin_read_txn(self):
+        """Start a REPEATABLE READ snapshot transaction for consistent reads.
+
+        All subsequent load()/loadBefore() queries will see a consistent
+        point-in-time snapshot until _end_read_txn() is called.
+        """
+        self._conn.execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ"
+        )
+        self._in_read_txn = True
 
     def poll_invalidations(self):
         """Return OIDs changed since last poll.
 
         Returns [] if nothing changed, list of OID bytes otherwise.
+
+        Starts a REPEATABLE READ snapshot FIRST, then queries for changes
+        within that snapshot.  This ensures that all subsequent load()
+        calls see the exact same database state as the invalidation
+        queries — preventing races where a concurrent commit lands
+        between the poll and the first load.
         """
+        # End any previous read snapshot
+        self._end_read_txn()
+
+        # Start a new REPEATABLE READ snapshot immediately.
+        # The first query anchors the snapshot — all subsequent queries
+        # (invalidation lookups AND load() calls) see this same state.
+        self._begin_read_txn()
+
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT COALESCE(MAX(tid), 0) AS max_tid "
@@ -704,24 +784,19 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             row = cur.fetchone()
             new_tid = row["max_tid"]
 
-        if self._polled_tid is not None and new_tid == self._polled_tid:
-            return []
-
-        if self._polled_tid is None:
-            # First poll — establish baseline, nothing to invalidate
-            self._polled_tid = new_tid
-            return []
-
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT zoid FROM object_state "
-                "WHERE tid > %s AND tid <= %s",
-                (self._polled_tid, new_tid),
-            )
-            rows = cur.fetchall()
+        result = []
+        if self._polled_tid is not None and new_tid != self._polled_tid:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT zoid FROM object_state "
+                    "WHERE tid > %s AND tid <= %s",
+                    (self._polled_tid, new_tid),
+                )
+                rows = cur.fetchall()
+            result = [p64(r["zoid"]) for r in rows]
 
         self._polled_tid = new_tid
-        return [p64(r["zoid"]) for r in rows]
+        return result
 
     def sync(self, force=True):
         """Sync snapshot.
@@ -853,9 +928,10 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
     def tpc_begin(self, transaction, tid=None, status=' '):
         """Begin a two-phase commit.
 
-        Starts an explicit PG transaction, acquires the advisory lock,
-        and generates a TID via the main storage.
+        Ends any active read snapshot, starts an explicit PG transaction,
+        acquires the advisory lock, and generates a TID.
         """
+        self._end_read_txn()
         self._transaction = transaction
         self._resolved = []
         self._tmp = []
@@ -921,8 +997,10 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         self._blob_tmp.clear()
         self._transaction = None
 
-    def checkCurrentSerialInTransaction(self, transaction, oid, serial):
+    def checkCurrentSerialInTransaction(self, oid, serial, transaction):
         """Verify that the object's serial hasn't changed."""
+        if transaction is not self._transaction:
+            raise StorageTransactionError(self, transaction)
         zoid = u64(oid)
         with self._conn.cursor() as cur:
             cur.execute(
@@ -932,7 +1010,9 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         if row is not None:
             current_serial = p64(row["tid"])
             if current_serial != serial:
-                raise ReadConflictError(oid=oid)
+                raise ReadConflictError(
+                    oid=oid, serials=(current_serial, serial),
+                )
 
     # ── IBlobStorage ─────────────────────────────────────────────────
 
