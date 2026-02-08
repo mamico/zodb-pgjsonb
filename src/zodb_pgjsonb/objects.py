@@ -1,18 +1,15 @@
 """ObjectStore — JSONB CRUD operations with zodb-json-codec transcoding."""
 
-import logging
-
-import psycopg
+from .schema import install_schema
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
-
 from ZODB.POSException import POSKeyError
 from ZODB.utils import p64
 from ZODB.utils import u64
 
+import logging
+import psycopg
 import zodb_json_codec
-
-from .schema import install_schema
 
 
 logger = logging.getLogger(__name__)
@@ -62,16 +59,20 @@ class ObjectStore:
         data = zodb_json_codec.encode_zodb_record(record)
         return data, p64(row["tid"])
 
-    def queue_store(self, *, oid, serial, data, class_mod, class_name, state, refs, transaction):
+    def queue_store(
+        self, *, oid, serial, data, class_mod, class_name, state, refs, transaction
+    ):
         """Queue an object store operation for the current transaction."""
-        self._pending.append({
-            "zoid": u64(oid),
-            "class_mod": class_mod,
-            "class_name": class_name,
-            "state": state,
-            "state_size": len(data),
-            "refs": refs,
-        })
+        self._pending.append(
+            {
+                "zoid": u64(oid),
+                "class_mod": class_mod,
+                "class_name": class_name,
+                "state": state,
+                "state_size": len(data),
+                "refs": refs,
+            }
+        )
 
     def flush_pending(self, tid):
         """Write all pending stores to PostgreSQL."""

@@ -6,22 +6,16 @@ from multiple threads without data corruption or deadlocks.
 Requires PostgreSQL on localhost:5433.
 """
 
-import threading
-
-import pytest
-
-import transaction as txn
-
-import ZODB
-from ZODB.POSException import ConflictError
-
 from BTrees.OOBTree import OOBTree
-
 from persistent.mapping import PersistentMapping
-
+from tests.conftest import DSN
+from ZODB.POSException import ConflictError
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-from tests.conftest import DSN
+import pytest
+import threading
+import transaction as txn
+import ZODB
 
 
 @pytest.fixture
@@ -78,9 +72,7 @@ class TestConcurrentWrites:
             except Exception as e:
                 errors.append((thread_id, e))
 
-        threads = [
-            threading.Thread(target=worker, args=(i,)) for i in range(N)
-        ]
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
         for t in threads:
             t.start()
         for t in threads:
@@ -116,9 +108,7 @@ class TestConcurrentWrites:
             except Exception as e:
                 errors.append((thread_id, e))
 
-        threads = [
-            threading.Thread(target=worker, args=(i,)) for i in range(N)
-        ]
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
         for t in threads:
             t.start()
         for t in threads:
@@ -162,9 +152,7 @@ class TestConcurrentWrites:
             finally:
                 c.close()
 
-        threads = [
-            threading.Thread(target=worker, args=(i,)) for i in range(N)
-        ]
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
         for t in threads:
             t.start()
         for t in threads:

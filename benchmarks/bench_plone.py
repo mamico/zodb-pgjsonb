@@ -18,7 +18,6 @@ import os
 import statistics
 import sys
 import time
-
 import transaction
 
 
@@ -28,18 +27,19 @@ def setup_zope(conf_path):
     saved_stdout = sys.stdout
     saved_stderr = sys.stderr
     sys.stdout = io.StringIO()
-    sys.stderr = open(os.devnull, "w")
-    try:
-        from Zope2.Startup.run import configure_wsgi
+    with open(os.devnull, "w") as devnull:
+        sys.stderr = devnull
+        try:
+            from Zope2.Startup.run import configure_wsgi
 
-        configure_wsgi(conf_path)
-    finally:
-        sys.stderr.close()
-        sys.stderr = saved_stderr
-        sys.stdout = saved_stdout
+            configure_wsgi(conf_path)
+        finally:
+            sys.stderr = saved_stderr
+            sys.stdout = saved_stdout
+
+    from Testing.makerequest import makerequest
 
     import Zope2
-    from Testing.makerequest import makerequest
 
     app = Zope2.app()
     return makerequest(app)

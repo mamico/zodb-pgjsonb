@@ -5,17 +5,14 @@ Proves: ZODB → pickle → zodb-json-codec → JSONB → PostgreSQL → JSONB �
 Requires a running PostgreSQL on localhost:5433 (see docker command in ARCHITECTURE.md).
 """
 
-import pytest
-
-import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
-
-import zodb_json_codec
-
+from tests.conftest import DSN
 from zodb_pgjsonb.schema import install_schema
 
-from tests.conftest import DSN
+import psycopg
+import pytest
+import zodb_json_codec
 
 
 @pytest.fixture
@@ -24,7 +21,9 @@ def conn():
     c = psycopg.connect(DSN, row_factory=dict_row)
     # Drop and recreate tables for a clean slate
     with c.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS blob_state, object_state, transaction_log CASCADE")
+        cur.execute(
+            "DROP TABLE IF EXISTS blob_state, object_state, transaction_log CASCADE"
+        )
     c.commit()
     install_schema(c)
     yield c
@@ -82,23 +81,28 @@ class TestPostgresRoundtrip:
         original_record = class_pickle + state_pickle
 
         # Decode to JSON-ready dict with ref extraction
-        class_mod, class_name, state, refs = (
-            zodb_json_codec.decode_zodb_record_for_pg(original_record)
+        class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
+            original_record
         )
 
         # Store in PostgreSQL
         zoid = 1
         tid = 1
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO transaction_log (tid) VALUES (%s)", (tid,)
-            )
+            cur.execute("INSERT INTO transaction_log (tid) VALUES (%s)", (tid,))
             cur.execute(
                 "INSERT INTO object_state "
                 "(zoid, tid, class_mod, class_name, state, state_size, refs) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (zoid, tid, class_mod, class_name, Json(state),
-                 len(original_record), refs),
+                (
+                    zoid,
+                    tid,
+                    class_mod,
+                    class_name,
+                    Json(state),
+                    len(original_record),
+                    refs,
+                ),
             )
         conn.commit()
 
@@ -161,8 +165,7 @@ class TestPostgresRoundtrip:
         # Query by JSONB attribute (cast to jsonb for @> operator)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT zoid FROM object_state "
-                "WHERE state @> %s::jsonb",
+                "SELECT zoid FROM object_state WHERE state @> %s::jsonb",
                 (Json({"title": "Report"}),),
             )
             rows = cur.fetchall()

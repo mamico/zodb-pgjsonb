@@ -6,30 +6,26 @@ new_instance(), poll_invalidations(), per-connection isolation.
 Requires PostgreSQL on localhost:5433.
 """
 
-import pytest
-
-import transaction as txn
-
-import ZODB
-from ZODB.interfaces import IMVCCStorage
-
 from persistent.mapping import PersistentMapping
-
+from tests.conftest import DSN
+from ZODB.interfaces import IMVCCStorage
 from zodb_pgjsonb.storage import PGJsonbStorage
 from zodb_pgjsonb.storage import PGJsonbStorageInstance
 
-from tests.conftest import DSN
+import pytest
+import transaction as txn
+import ZODB
 
 
 @pytest.fixture
 def storage():
     """Fresh PGJsonbStorage with clean database."""
     import psycopg
+
     conn = psycopg.connect(DSN)
     with conn.cursor() as cur:
         cur.execute(
-            "DROP TABLE IF EXISTS "
-            "blob_state, object_state, transaction_log CASCADE"
+            "DROP TABLE IF EXISTS blob_state, object_state, transaction_log CASCADE"
         )
     conn.commit()
     conn.close()
@@ -144,12 +140,14 @@ class TestPollInvalidations:
 
         # Create a minimal object
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
         }
         data = zodb_json_codec.encode_zodb_record(record)
         from ZODB.utils import z64
+
         oid = writer.new_oid()
         writer.store(oid, z64, data, "", t)
         writer.tpc_vote(t)

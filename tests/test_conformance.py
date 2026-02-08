@@ -17,12 +17,7 @@ These are unittest-based tests (as required by ZODB test infrastructure).
 Requires PostgreSQL on localhost:5433.
 """
 
-import threading
-import time
-import unittest
-
-import psycopg
-
+from tests.conftest import DSN
 from ZODB import utils
 from ZODB.Connection import TransactionMetaData
 from ZODB.tests.BasicStorage import BasicStorage
@@ -38,10 +33,12 @@ from ZODB.tests.StorageTestBase import ZERO
 from ZODB.tests.StorageTestBase import zodb_pickle
 from ZODB.tests.Synchronization import SynchronizedStorage
 from ZODB.tests.TransactionalUndoStorage import TransactionalUndoStorage
-
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-from tests.conftest import DSN
+import psycopg
+import threading
+import time
+import unittest
 
 
 def _clean_db():
@@ -91,14 +88,14 @@ class PGJsonbConformanceHF(StorageTestBase, BasicStorage, SynchronizedStorage):
         """
         t = TransactionMetaData()
         self._storage.tpc_begin(t)
-        self._storage.store(ZERO, ZERO, zodb_pickle(MinPO(1)), '', t)
+        self._storage.store(ZERO, ZERO, zodb_pickle(MinPO(1)), "", t)
         self._storage.tpc_vote(t)
         tids = []
         self._storage.tpc_finish(t, lambda tid: tids.append(tid))
 
         t = TransactionMetaData()
         self._storage.tpc_begin(t)
-        self._storage.store(ZERO, tids[0], zodb_pickle(MinPO(2)), '', t)
+        self._storage.store(ZERO, tids[0], zodb_pickle(MinPO(2)), "", t)
         self._storage.tpc_vote(t)
 
         to_join = []
@@ -118,6 +115,7 @@ class PGJsonbConformanceHF(StorageTestBase, BasicStorage, SynchronizedStorage):
                 started.set()
                 tids.append(tid)
                 finish.wait()
+
             self._storage.tpc_finish(t, callback)
 
         results = {}
@@ -133,20 +131,20 @@ class PGJsonbConformanceHF(StorageTestBase, BasicStorage, SynchronizedStorage):
         @run_in_thread
         def load():
             update_attempts()
-            results['load'] = utils.load_current(self._storage, ZERO)[1]
-            results['lastTransaction'] = self._storage.lastTransaction()
+            results["load"] = utils.load_current(self._storage, ZERO)[1]
+            results["lastTransaction"] = self._storage.lastTransaction()
 
         expected_attempts = 1
 
-        if hasattr(self._storage, 'getTid'):
+        if hasattr(self._storage, "getTid"):
             expected_attempts += 1
 
             @run_in_thread
             def getTid():
                 update_attempts()
-                results['getTid'] = self._storage.getTid(ZERO)
+                results["getTid"] = self._storage.getTid(ZERO)
 
-        if hasattr(self._storage, 'lastInvalidations'):
+        if hasattr(self._storage, "lastInvalidations"):
             expected_attempts += 1
 
             @run_in_thread
@@ -154,21 +152,21 @@ class PGJsonbConformanceHF(StorageTestBase, BasicStorage, SynchronizedStorage):
                 update_attempts()
                 invals = self._storage.lastInvalidations(1)
                 if invals:
-                    results['lastInvalidations'] = invals[0][0]
+                    results["lastInvalidations"] = invals[0][0]
 
         with attempts_cond:
             while len(attempts) < expected_attempts:
                 attempts_cond.wait()
 
-        time.sleep(.01)
+        time.sleep(0.01)
         finish.set()
 
         for thr in to_join:
             thr.join(1)
 
-        self.assertEqual(results.pop('load'), tids[1])
-        self.assertEqual(results.pop('lastTransaction'), tids[1])
-        for m, tid in results.items():
+        self.assertEqual(results.pop("load"), tids[1])
+        self.assertEqual(results.pop("lastTransaction"), tids[1])
+        for _m, tid in results.items():
             self.assertEqual(tid, tids[1])
 
     def test_checkCurrentSerialInTransaction(self):
@@ -303,8 +301,10 @@ class PGJsonbUndoHP(StorageTestBase, TransactionalUndoStorage):
 # ── Recovery Conformance ─────────────────────────────────────────────
 
 
-@unittest.skip("Recovery tests require a second database; "
-               "both source and dst share the same tables via same DSN")
+@unittest.skip(
+    "Recovery tests require a second database; "
+    "both source and dst share the same tables via same DSN"
+)
 class PGJsonbRecoveryHP(StorageTestBase, RecoveryStorage):
     """ZODB conformance — recovery (history-preserving mode).
 
@@ -323,10 +323,10 @@ class PGJsonbRecoveryHP(StorageTestBase, RecoveryStorage):
         self._dst = PGJsonbStorage(DSN, history_preserving=True)
 
     def tearDown(self):
-        if hasattr(self, '_dst'):
+        if hasattr(self, "_dst"):
             self._dst.close()
         super().tearDown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

@@ -13,28 +13,35 @@ Requires PostgreSQL on localhost:5433.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from dataclasses import field
+from datetime import datetime
+from datetime import UTC
+from pathlib import Path
+from ZODB.tests.MinPO import MinPO
+from ZODB.tests.StorageTestBase import zodb_pickle
+
 import argparse
+import contextlib
 import json
+import psycopg
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-
-import psycopg
-from ZODB.tests.MinPO import MinPO
-from ZODB.tests.StorageTestBase import zodb_pickle
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-PGJSONB_DSN = "dbname=zodb_bench_pgjsonb user=zodb password=zodb host=localhost port=5433"
-RELSTORAGE_DSN = "dbname=zodb_bench_relstorage user=zodb password=zodb host=localhost port=5433"
+PGJSONB_DSN = (
+    "dbname=zodb_bench_pgjsonb user=zodb password=zodb host=localhost port=5433"
+)
+RELSTORAGE_DSN = (
+    "dbname=zodb_bench_relstorage user=zodb password=zodb host=localhost port=5433"
+)
 
 HEADER = "\033[1m"
 RESET = "\033[0m"
@@ -237,10 +244,8 @@ def make_backends() -> list[tuple[str, object]]:
 
 def close_backends(backends: list[tuple[str, object]]):
     for _, storage in backends:
-        try:
+        with contextlib.suppress(Exception):
             storage.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +270,7 @@ def _bench_store_single(storage, iterations, warmup):
         idx[0] += 1
         t = TransactionMetaData()
         storage.tpc_begin(t)
-        storage.store(oid, z64, data, '', t)
+        storage.store(oid, z64, data, "", t)
         storage.tpc_vote(t)
         storage.tpc_finish(t)
 
@@ -288,7 +293,7 @@ def _bench_store_batch(storage, batch_size, iterations, warmup):
         for _ in range(batch_size):
             oid = oids[idx[0]]
             idx[0] += 1
-            storage.store(oid, z64, data, '', t)
+            storage.store(oid, z64, data, "", t)
         storage.tpc_vote(t)
         storage.tpc_finish(t)
 
@@ -305,7 +310,7 @@ def _bench_load_single(storage, iterations, warmup):
     data = zodb_pickle(MinPO(42))
     t = TransactionMetaData()
     storage.tpc_begin(t)
-    storage.store(oid, z64, data, '', t)
+    storage.store(oid, z64, data, "", t)
     storage.tpc_vote(t)
     storage.tpc_finish(t)
 
@@ -328,7 +333,7 @@ def _bench_load_batch(storage, batch_size, iterations, warmup):
     for _ in range(batch_size):
         oid = storage.new_oid()
         oids.append(oid)
-        storage.store(oid, z64, data, '', t)
+        storage.store(oid, z64, data, "", t)
     storage.tpc_vote(t)
     storage.tpc_finish(t)
 
@@ -346,19 +351,32 @@ def run_storage_benchmarks(iterations, warmup):
     benchmarks = [
         ("store single", lambda s: _bench_store_single(s, iterations, warmup)),
         ("store batch 10", lambda s: _bench_store_batch(s, 10, iterations, warmup)),
-        ("store batch 100", lambda s: _bench_store_batch(s, 100, max(iterations // 5, 10), warmup)),
+        (
+            "store batch 100",
+            lambda s: _bench_store_batch(s, 100, max(iterations // 5, 10), warmup),
+        ),
         ("load single", lambda s: _bench_load_single(s, iterations, warmup)),
-        ("load batch 100", lambda s: _bench_load_batch(s, 100, max(iterations // 5, 10), warmup)),
+        (
+            "load batch 100",
+            lambda s: _bench_load_batch(s, 100, max(iterations // 5, 10), warmup),
+        ),
     ]
 
     for bench_name, bench_fn in benchmarks:
         results[bench_name] = {}
-        for backend_name, make_fn in [("PGJsonbStorage", make_pgjsonb), ("RelStorage", make_relstorage)]:
+        for backend_name, make_fn in [
+            ("PGJsonbStorage", make_pgjsonb),
+            ("RelStorage", make_relstorage),
+        ]:
             storage = make_fn()
             if storage is None:
                 continue
             try:
-                print(f"  {DIM}{bench_name} ({backend_name})...{RESET}", end="", flush=True)
+                print(
+                    f"  {DIM}{bench_name} ({backend_name})...{RESET}",
+                    end="",
+                    flush=True,
+                )
                 stats = bench_fn(storage)
                 results[bench_name][backend_name] = stats
                 print(f" {_fmt_ms(stats.mean)}")
@@ -401,9 +419,9 @@ def _bench_zodb_write_simple(db, iterations, warmup):
 
 def _bench_zodb_write_btree(db, iterations, warmup):
     """Benchmark: insert into OOBTree through ZODB.DB."""
-    import transaction
-
     from BTrees.OOBTree import OOBTree
+
+    import transaction
 
     conn = db.open()
     conn.root()["tree"] = OOBTree()
@@ -507,23 +525,44 @@ def run_zodb_benchmarks(iterations, warmup):
     results = {}
 
     benchmarks = [
-        ("zodb write simple", lambda db: _bench_zodb_write_simple(db, iterations, warmup)),
-        ("zodb write btree", lambda db: _bench_zodb_write_btree(db, iterations, warmup)),
+        (
+            "zodb write simple",
+            lambda db: _bench_zodb_write_simple(db, iterations, warmup),
+        ),
+        (
+            "zodb write btree",
+            lambda db: _bench_zodb_write_btree(db, iterations, warmup),
+        ),
         ("zodb read", lambda db: _bench_zodb_read(db, iterations, warmup)),
-        ("zodb connection cycle", lambda db: _bench_zodb_connection_cycle(db, iterations, warmup)),
-        ("zodb write batch 10", lambda db: _bench_zodb_write_batch(db, 10, max(iterations // 5, 10), warmup)),
+        (
+            "zodb connection cycle",
+            lambda db: _bench_zodb_connection_cycle(db, iterations, warmup),
+        ),
+        (
+            "zodb write batch 10",
+            lambda db: _bench_zodb_write_batch(
+                db, 10, max(iterations // 5, 10), warmup
+            ),
+        ),
     ]
 
     for bench_name, bench_fn in benchmarks:
         results[bench_name] = {}
-        for backend_name, make_fn in [("PGJsonbStorage", make_pgjsonb), ("RelStorage", make_relstorage)]:
+        for backend_name, make_fn in [
+            ("PGJsonbStorage", make_pgjsonb),
+            ("RelStorage", make_relstorage),
+        ]:
             storage = make_fn()
             if storage is None:
                 continue
             db = None
             try:
                 db = ZODB.DB(storage)
-                print(f"  {DIM}{bench_name} ({backend_name})...{RESET}", end="", flush=True)
+                print(
+                    f"  {DIM}{bench_name} ({backend_name})...{RESET}",
+                    end="",
+                    flush=True,
+                )
                 stats = bench_fn(db)
                 results[bench_name][backend_name] = stats
                 print(f" {_fmt_ms(stats.mean)}")
@@ -549,11 +588,10 @@ def _bench_pack(make_fn, n_objects):
     Populates the storage via ZODB.DB, then packs through the DB
     (which keeps the storage open).
     """
-    import ZODB
-
     from persistent.mapping import PersistentMapping
 
     import transaction
+    import ZODB
 
     storage = make_fn()
     if storage is None:
@@ -581,7 +619,7 @@ def _bench_pack(make_fn, n_objects):
         storage.tpc_begin(t)
         for _ in range(garbage):
             oid = storage.new_oid()
-            storage.store(oid, z64, data, '', t)
+            storage.store(oid, z64, data, "", t)
         storage.tpc_vote(t)
         storage.tpc_finish(t)
 
@@ -609,15 +647,24 @@ def run_pack_benchmarks():
 
     for n_objects in [100, 1000, 10000]:
         results[n_objects] = {}
-        for backend_name, make_fn in [("PGJsonbStorage", make_pgjsonb), ("RelStorage", make_relstorage)]:
-            print(f"  {DIM}pack {n_objects} ({backend_name})...{RESET}", end="", flush=True)
+        for backend_name, make_fn in [
+            ("PGJsonbStorage", make_pgjsonb),
+            ("RelStorage", make_relstorage),
+        ]:
+            print(
+                f"  {DIM}pack {n_objects} ({backend_name})...{RESET}",
+                end="",
+                flush=True,
+            )
             result = _bench_pack(make_fn, n_objects)
             if result is not None:
                 elapsed_ms, reachable, garbage = result
                 results[n_objects][backend_name] = elapsed_ms
-                print(f" {_fmt_ms(elapsed_ms)} ({reachable} reachable, {garbage} garbage)")
+                print(
+                    f" {_fmt_ms(elapsed_ms)} ({reachable} reachable, {garbage} garbage)"
+                )
             else:
-                print(f" skipped")
+                print(" skipped")
 
     return results
 
@@ -720,9 +767,12 @@ def _run_plone_worker(conf_path, backend_name, n_docs):
         [
             sys.executable,
             str(WORKER_SCRIPT),
-            "--conf", conf_path,
-            "--backend", backend_name,
-            "--docs", str(n_docs),
+            "--conf",
+            conf_path,
+            "--backend",
+            backend_name,
+            "--docs",
+            str(n_docs),
         ],
         capture_output=True,
         text=True,
@@ -738,9 +788,9 @@ def _run_plone_worker(conf_path, backend_name, n_docs):
         return None
 
     # Parse JSON from stdout (last non-empty line)
-    stdout_lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
+    stdout_lines = [line for line in result.stdout.strip().split("\n") if line.strip()]
     if not stdout_lines:
-        print(f" FAILED (no output)")
+        print(" FAILED (no output)")
         return None
 
     try:
@@ -761,8 +811,9 @@ def run_plone_benchmarks(n_docs):
 
         # Check if RelStorage is available
         try:
-            import relstorage  # noqa: F401
             import psycopg2  # noqa: F401
+            import relstorage  # noqa: F401
+
             backends.append(("RelStorage", RELSTORAGE_DSN, "relstorage"))
         except ImportError:
             pass
@@ -786,7 +837,9 @@ def run_plone_benchmarks(n_docs):
                 site_ms = worker_result.get("site_creation_ms", 0)
                 create_ms = worker_result.get("content_creation", {}).get("mean_ms", 0)
                 query_ms = worker_result.get("catalog_query", {}).get("mean_ms", 0)
-                modify_ms = worker_result.get("content_modification", {}).get("mean_ms", 0)
+                modify_ms = worker_result.get("content_modification", {}).get(
+                    "mean_ms", 0
+                )
                 print(
                     f"    site: {_fmt_ms(site_ms)}, "
                     f"create: {_fmt_ms(create_ms)}/doc, "
@@ -810,7 +863,9 @@ def print_storage_results(results: dict, iterations: int, warmup: int):
     has_relstorage = any("RelStorage" in v for v in results.values())
 
     if has_relstorage:
-        print(f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}")
+        print(
+            f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}"
+        )
         print(f"  {'-' * 70}")
     else:
         print(f"  {'Operation':<24} {'PGJsonb':>12}")
@@ -824,10 +879,11 @@ def print_storage_results(results: dict, iterations: int, warmup: int):
 
         if has_relstorage:
             rs_str = _fmt_ms(rs_stats.mean) if rs_stats else "N/A"
-            if pgjsonb_stats and rs_stats:
-                cmp_str = _comparison(pgjsonb_stats.mean, rs_stats.mean)
-            else:
-                cmp_str = ""
+            cmp_str = (
+                _comparison(pgjsonb_stats.mean, rs_stats.mean)
+                if pgjsonb_stats and rs_stats
+                else ""
+            )
             print(f"  {bench_name:<24} {pj_str:>12} {rs_str:>12} {cmp_str:>20}")
         else:
             print(f"  {bench_name:<24} {pj_str:>12}")
@@ -843,7 +899,9 @@ def print_zodb_results(results: dict, iterations: int, warmup: int):
     has_relstorage = any("RelStorage" in v for v in results.values())
 
     if has_relstorage:
-        print(f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}")
+        print(
+            f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}"
+        )
         print(f"  {'-' * 70}")
     else:
         print(f"  {'Operation':<24} {'PGJsonb':>12}")
@@ -857,10 +915,11 @@ def print_zodb_results(results: dict, iterations: int, warmup: int):
 
         if has_relstorage:
             rs_str = _fmt_ms(rs_stats.mean) if rs_stats else "N/A"
-            if pgjsonb_stats and rs_stats:
-                cmp_str = _comparison(pgjsonb_stats.mean, rs_stats.mean)
-            else:
-                cmp_str = ""
+            cmp_str = (
+                _comparison(pgjsonb_stats.mean, rs_stats.mean)
+                if pgjsonb_stats and rs_stats
+                else ""
+            )
             print(f"  {bench_name:<24} {pj_str:>12} {rs_str:>12} {cmp_str:>20}")
         else:
             print(f"  {bench_name:<24} {pj_str:>12}")
@@ -870,13 +929,15 @@ def print_zodb_results(results: dict, iterations: int, warmup: int):
 
 def print_pack_results(results: dict):
     print(f"\n{HEADER}{'=' * 78}")
-    print(f" Pack / GC")
+    print(" Pack / GC")
     print(f"{'=' * 78}{RESET}\n")
 
     has_relstorage = any("RelStorage" in v for v in results.values())
 
     if has_relstorage:
-        print(f"  {'Objects':<12} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}")
+        print(
+            f"  {'Objects':<12} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}"
+        )
         print(f"  {'-' * 58}")
     else:
         print(f"  {'Objects':<12} {'PGJsonb':>12}")
@@ -890,10 +951,11 @@ def print_pack_results(results: dict):
 
         if has_relstorage:
             rs_str = _fmt_ms(rs_ms) if rs_ms is not None else "N/A"
-            if pj_ms is not None and rs_ms is not None:
-                cmp_str = _comparison(pj_ms, rs_ms)
-            else:
-                cmp_str = ""
+            cmp_str = (
+                _comparison(pj_ms, rs_ms)
+                if pj_ms is not None and rs_ms is not None
+                else ""
+            )
             print(f"  {n_objects:<12} {pj_str:>12} {rs_str:>12} {cmp_str:>20}")
         else:
             print(f"  {n_objects:<12} {pj_str:>12}")
@@ -909,7 +971,9 @@ def print_plone_results(results: dict, n_docs: int):
     has_relstorage = "RelStorage" in results
 
     if has_relstorage:
-        print(f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}")
+        print(
+            f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}"
+        )
         print(f"  {'-' * 70}")
     else:
         print(f"  {'Operation':<24} {'PGJsonb':>12}")
@@ -938,10 +1002,11 @@ def print_plone_results(results: dict, n_docs: int):
 
         if has_relstorage:
             rs_str = _fmt_ms(rs_val) if rs_val is not None else "N/A"
-            if pj_val is not None and rs_val is not None:
-                cmp_str = _comparison(pj_val, rs_val)
-            else:
-                cmp_str = ""
+            cmp_str = (
+                _comparison(pj_val, rs_val)
+                if pj_val is not None and rs_val is not None
+                else ""
+            )
             print(f"  {label:<24} {pj_str:>12} {rs_str:>12} {cmp_str:>20}")
         else:
             print(f"  {label:<24} {pj_str:>12}")
@@ -963,7 +1028,7 @@ def results_to_json(
     warmup: int,
 ) -> dict:
     out: dict = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "python_version": sys.version,
         "iterations": iterations,
         "warmup": warmup,
@@ -971,12 +1036,14 @@ def results_to_json(
 
     try:
         import zodb_pgjsonb
+
         out["pgjsonb_version"] = getattr(zodb_pgjsonb, "__version__", "dev")
     except Exception:
         pass
 
     try:
         import relstorage
+
         out["relstorage_version"] = getattr(relstorage, "__version__", "unknown")
     except ImportError:
         pass
@@ -985,24 +1052,21 @@ def results_to_json(
         out["storage"] = {}
         for bench_name, backend_results in storage_results.items():
             out["storage"][bench_name] = {
-                name: stats.to_dict()
-                for name, stats in backend_results.items()
+                name: stats.to_dict() for name, stats in backend_results.items()
             }
 
     if zodb_results:
         out["zodb"] = {}
         for bench_name, backend_results in zodb_results.items():
             out["zodb"][bench_name] = {
-                name: stats.to_dict()
-                for name, stats in backend_results.items()
+                name: stats.to_dict() for name, stats in backend_results.items()
             }
 
     if pack_results:
         out["pack"] = {}
         for n_objects, backend_results in pack_results.items():
             out["pack"][str(n_objects)] = {
-                name: {"time_ms": round(ms, 3)}
-                for name, ms in backend_results.items()
+                name: {"time_ms": round(ms, 3)} for name, ms in backend_results.items()
             }
 
     if plone_results:
@@ -1077,8 +1141,9 @@ def main() -> None:
 
     # Check RelStorage availability
     try:
-        import relstorage  # noqa: F401
         import psycopg2  # noqa: F401
+        import relstorage  # noqa: F401
+
         print(f"  {DIM}RelStorage available (comparison enabled){RESET}")
     except ImportError:
         print(f"  {DIM}RelStorage not available (PGJsonbStorage-only){RESET}")
@@ -1117,8 +1182,12 @@ def main() -> None:
             print_plone_results(plone_results, n_docs)
 
     json_data = results_to_json(
-        storage_results, zodb_results, pack_results, plone_results,
-        iterations, warmup,
+        storage_results,
+        zodb_results,
+        pack_results,
+        plone_results,
+        iterations,
+        warmup,
     )
 
     if fmt in ("json", "both"):

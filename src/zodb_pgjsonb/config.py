@@ -18,8 +18,8 @@ class PGJsonbStorageFactory(BaseConfig):
         blob_cache = None
         if getattr(config, "s3_bucket_name", None):
             try:
-                from zodb_s3blobs.s3client import S3Client
                 from zodb_s3blobs.cache import S3BlobCache
+                from zodb_s3blobs.s3client import S3Client
             except ImportError as exc:
                 raise ImportError(
                     "S3 blob storage requires the [s3] extra: "
@@ -35,10 +35,7 @@ class PGJsonbStorageFactory(BaseConfig):
                 aws_secret_access_key=getattr(config, "s3_secret_key", None),
                 use_ssl=getattr(config, "s3_use_ssl", True),
             )
-            cache_dir = (
-                getattr(config, "blob_cache_dir", None)
-                or config.blob_temp_dir
-            )
+            cache_dir = getattr(config, "blob_cache_dir", None) or config.blob_temp_dir
             cache_size = getattr(config, "blob_cache_size", 1024 * 1024 * 1024)
             blob_cache = S3BlobCache(
                 cache_dir=cache_dir,

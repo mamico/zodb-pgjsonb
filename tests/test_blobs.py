@@ -7,27 +7,23 @@ Also tests S3 tiered blob storage (Phase 6).
 Requires PostgreSQL on localhost:5433.
 """
 
-import os
-import tempfile
-
-import boto3
-import pytest
 from moto import mock_aws
-
-import transaction as txn
-
-import ZODB
+from persistent.mapping import PersistentMapping
+from tests.conftest import DSN
 from ZODB.blob import Blob
 from ZODB.interfaces import IBlobStorage
 from ZODB.POSException import POSKeyError
 from ZODB.utils import z64
-
-from persistent.mapping import PersistentMapping
-
 from zodb_pgjsonb.storage import PGJsonbStorage
-from zodb_pgjsonb.storage import PGJsonbStorageInstance
 
-from tests.conftest import DSN
+import boto3
+import os
+import pytest
+import tempfile
+import transaction as txn
+import ZODB
+
+
 S3_BUCKET = "test-zodb-blobs"
 S3_REGION = "us-east-1"
 
@@ -35,6 +31,7 @@ S3_REGION = "us-east-1"
 def _clean_db():
     """Drop all tables for a clean test database."""
     import psycopg
+
     conn = psycopg.connect(DSN)
     with conn.cursor() as cur:
         cur.execute(
@@ -72,8 +69,8 @@ def s3_storage(tmp_path):
         client = boto3.client("s3", region_name=S3_REGION)
         client.create_bucket(Bucket=S3_BUCKET)
 
-        from zodb_s3blobs.s3client import S3Client
         from zodb_s3blobs.cache import S3BlobCache
+        from zodb_s3blobs.s3client import S3Client
 
         s3_client = S3Client(
             bucket_name=S3_BUCKET,
@@ -144,6 +141,7 @@ class TestBlobStoreAndLoad:
 
         # Create a minimal object with blob
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -160,7 +158,7 @@ class TestBlobStoreAndLoad:
         # Load the blob back
         loaded_path = inst.loadBlob(oid, tid)
         assert os.path.isfile(loaded_path)
-        with open(loaded_path, 'rb') as f:
+        with open(loaded_path, "rb") as f:
             assert f.read() == blob_data
 
         inst.release()
@@ -177,6 +175,7 @@ class TestBlobStoreAndLoad:
         assert os.path.exists(blob_path)
 
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -200,6 +199,7 @@ class TestBlobStoreAndLoad:
         inst.poll_invalidations()
 
         from ZODB.utils import p64
+
         with pytest.raises(POSKeyError):
             inst.loadBlob(p64(999), p64(999))
 
@@ -216,6 +216,7 @@ class TestBlobStoreAndLoad:
         os.close(fd)
 
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -247,6 +248,7 @@ class TestBlobStoreAndLoad:
         os.close(fd)
 
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -387,6 +389,7 @@ class TestS3BlobTiering:
         os.close(fd)
 
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -401,8 +404,10 @@ class TestS3BlobTiering:
         tid = inst.tpc_finish(t)
 
         # Verify: blob is in PG (data not NULL, s3_key NULL)
-        import psycopg
         from ZODB.utils import u64
+
+        import psycopg
+
         conn = psycopg.connect(DSN)
         with conn.cursor() as cur:
             cur.execute(
@@ -417,7 +422,7 @@ class TestS3BlobTiering:
 
         # Load it back
         loaded_path = inst.loadBlob(oid, tid)
-        with open(loaded_path, 'rb') as f:
+        with open(loaded_path, "rb") as f:
             assert f.read() == blob_data
 
         inst.release()
@@ -434,6 +439,7 @@ class TestS3BlobTiering:
         os.close(fd)
 
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -445,11 +451,13 @@ class TestS3BlobTiering:
         oid = inst.new_oid()
         inst.storeBlob(oid, z64, data, blob_path, "", t)
         inst.tpc_vote(t)
-        tid = inst.tpc_finish(t)
+        _tid = inst.tpc_finish(t)
 
         # Verify: blob metadata is in PG (data NULL, s3_key set)
-        import psycopg
         from ZODB.utils import u64
+
+        import psycopg
+
         conn = psycopg.connect(DSN)
         with conn.cursor() as cur:
             cur.execute(
@@ -476,6 +484,7 @@ class TestS3BlobTiering:
         os.close(fd)
 
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -492,7 +501,7 @@ class TestS3BlobTiering:
         # Load — should download from S3
         loaded_path = inst.loadBlob(oid, tid)
         assert os.path.isfile(loaded_path)
-        with open(loaded_path, 'rb') as f:
+        with open(loaded_path, "rb") as f:
             assert f.read() == blob_data
 
         inst.release()
@@ -508,6 +517,7 @@ class TestS3BlobTiering:
         os.close(fd)
 
         import zodb_json_codec
+
         record = {
             "@cls": ["persistent.mapping", "PersistentMapping"],
             "@s": {"data": {}},
@@ -531,7 +541,7 @@ class TestS3BlobTiering:
             os.unlink(path1)
         path2 = inst.loadBlob(oid, tid)
         assert os.path.isfile(path2)
-        with open(path2, 'rb') as f:
+        with open(path2, "rb") as f:
             assert f.read() == blob_data
 
         inst.release()
@@ -548,8 +558,8 @@ class TestS3BlobTiering:
             client = boto3.client("s3", region_name=S3_REGION)
             client.create_bucket(Bucket=S3_BUCKET)
 
-            from zodb_s3blobs.s3client import S3Client
             from zodb_s3blobs.cache import S3BlobCache
+            from zodb_s3blobs.s3client import S3Client
 
             s3_client = S3Client(
                 bucket_name=S3_BUCKET,
@@ -575,6 +585,7 @@ class TestS3BlobTiering:
             os.close(fd)
 
             import zodb_json_codec
+
             record = {
                 "@cls": ["persistent.mapping", "PersistentMapping"],
                 "@s": {"data": {}},
@@ -589,8 +600,10 @@ class TestS3BlobTiering:
             tid = inst.tpc_finish(t)
 
             # Verify it's in S3
-            import psycopg
             from ZODB.utils import u64
+
+            import psycopg
+
             conn = psycopg.connect(DSN)
             with conn.cursor() as cur:
                 cur.execute(
@@ -605,7 +618,7 @@ class TestS3BlobTiering:
 
             # Load it back
             loaded_path = inst.loadBlob(oid, tid)
-            with open(loaded_path, 'rb') as f:
+            with open(loaded_path, "rb") as f:
                 assert f.read() == blob_data
 
             inst.release()

@@ -8,27 +8,25 @@ and history-aware pack.
 Requires PostgreSQL on localhost:5433.
 """
 
-import time
-
-import pytest
-
-import transaction as txn
-
-import ZODB
-from ZODB.interfaces import IStorageUndoable
-from ZODB.utils import p64, u64, z64
-
 from persistent.mapping import PersistentMapping
-
+from tests.conftest import DSN
+from ZODB.interfaces import IStorageUndoable
+from ZODB.utils import p64
+from ZODB.utils import u64
+from ZODB.utils import z64
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-from tests.conftest import DSN
+import pytest
+import time
+import transaction as txn
+import ZODB
 
 
 @pytest.fixture
 def hp_storage():
     """Fresh PGJsonbStorage in history-preserving mode."""
     import psycopg
+
     conn = psycopg.connect(DSN)
     with conn.cursor() as cur:
         cur.execute(
@@ -56,8 +54,10 @@ class TestHistoryPreservingSchema:
     """Test that history tables are created in HP mode."""
 
     def test_schema_creates_history_tables(self, hp_storage):
-        import psycopg
         from psycopg.rows import dict_row
+
+        import psycopg
+
         pg_conn = psycopg.connect(DSN, row_factory=dict_row)
         with pg_conn.cursor() as cur:
             cur.execute(
@@ -85,8 +85,9 @@ class TestDualWrite:
     """Test that stores write to both tables in HP mode."""
 
     def test_store_writes_to_both_tables(self, hp_db):
-        import psycopg
         from psycopg.rows import dict_row
+
+        import psycopg
 
         conn = hp_db.open()
         root = conn.root()
@@ -108,8 +109,9 @@ class TestDualWrite:
         assert history_count >= 1
 
     def test_multiple_revisions_in_history(self, hp_db):
-        import psycopg
         from psycopg.rows import dict_row
+
+        import psycopg
 
         conn = hp_db.open()
         root = conn.root()
@@ -126,15 +128,11 @@ class TestDualWrite:
         pg_conn = psycopg.connect(DSN, row_factory=dict_row)
         with pg_conn.cursor() as cur:
             # Root has 1 entry in object_state (current)
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM object_state WHERE zoid = 0"
-            )
+            cur.execute("SELECT COUNT(*) AS cnt FROM object_state WHERE zoid = 0")
             assert cur.fetchone()["cnt"] == 1
 
             # Root has multiple entries in object_history
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0"
-            )
+            cur.execute("SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0")
             assert cur.fetchone()["cnt"] >= 3
         pg_conn.close()
 
@@ -157,7 +155,7 @@ class TestLoadBefore:
         # Load state before tid2 → should get tid1's state
         result = hp_storage.loadBefore(z64, tid2)
         assert result is not None
-        data, start_tid, end_tid = result
+        _data, start_tid, end_tid = result
         assert start_tid == tid1
         assert end_tid == tid2
 
@@ -181,7 +179,7 @@ class TestLoadBefore:
         future_tid = p64(u64(tid) + 1)
         result = hp_storage.loadBefore(z64, future_tid)
         assert result is not None
-        data, start_tid, end_tid = result
+        _data, start_tid, end_tid = result
         assert start_tid == tid
         assert end_tid is None  # no newer revision
 
@@ -202,6 +200,7 @@ class TestLoadSerial:
 
         # Load the old revision by tid1
         import zodb_json_codec
+
         data = hp_storage.loadSerial(z64, tid1)
         record = zodb_json_codec.decode_zodb_record(data)
         assert record["@s"]["data"]["val"] == "first"
@@ -259,6 +258,7 @@ class TestUndoInterface:
     def test_supports_undo_false_history_free(self):
         """History-free storage does not support undo."""
         import psycopg
+
         conn = psycopg.connect(DSN)
         with conn.cursor() as cur:
             cur.execute(
@@ -305,10 +305,7 @@ class TestUndoInterface:
         txn.commit()
         conn.close()
 
-        log = hp_storage.undoLog(
-            0, -20,
-            filter=lambda d: d["description"] == b"keep"
-        )
+        log = hp_storage.undoLog(0, -20, filter=lambda d: d["description"] == b"keep")
         assert all(d["description"] == b"keep" for d in log)
 
     def test_undo_info_works(self, hp_db, hp_storage):
@@ -355,8 +352,9 @@ class TestHistoryPack:
     """Test pack with history-preserving mode."""
 
     def test_pack_removes_old_history(self, hp_db, hp_storage):
-        import psycopg
         from psycopg.rows import dict_row
+
+        import psycopg
 
         conn = hp_db.open()
         root = conn.root()
@@ -373,9 +371,7 @@ class TestHistoryPack:
         # Count history rows before pack
         pg_conn = psycopg.connect(DSN, row_factory=dict_row)
         with pg_conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0"
-            )
+            cur.execute("SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0")
             before = cur.fetchone()["cnt"]
         pg_conn.close()
 
@@ -387,17 +383,16 @@ class TestHistoryPack:
         # Some old history should be removed
         pg_conn = psycopg.connect(DSN, row_factory=dict_row)
         with pg_conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0"
-            )
+            cur.execute("SELECT COUNT(*) AS cnt FROM object_history WHERE zoid = 0")
             after = cur.fetchone()["cnt"]
         pg_conn.close()
 
         assert after < before
 
     def test_pack_removes_unreachable_history(self, hp_db, hp_storage):
-        import psycopg
         from psycopg.rows import dict_row
+
+        import psycopg
 
         conn = hp_db.open()
         root = conn.root()
@@ -417,9 +412,7 @@ class TestHistoryPack:
         pg_conn = psycopg.connect(DSN, row_factory=dict_row)
         with pg_conn.cursor() as cur:
             # The child object should not be in object_state
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM object_state WHERE zoid != 0"
-            )
+            cur.execute("SELECT COUNT(*) AS cnt FROM object_state WHERE zoid != 0")
             orphan_state = cur.fetchone()["cnt"]
             # The child should also be gone from object_history
             cur.execute(

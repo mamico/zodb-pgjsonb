@@ -9,22 +9,13 @@ PGJsonbStorageInstance via new_instance(), providing per-connection
 snapshot isolation through separate PostgreSQL connections.
 """
 
-import base64
-import logging
-import os
-import shutil
-import sys
-import tempfile
-import time
+from .interfaces import IPGJsonbStorage
+from .schema import install_schema
 from collections import OrderedDict
-
-import psycopg
-import zope.interface
+from persistent.TimeStamp import TimeStamp
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
-
-from persistent.TimeStamp import TimeStamp
 from ZODB.BaseStorage import BaseStorage
 from ZODB.BaseStorage import DataRecord
 from ZODB.BaseStorage import TransactionRecord
@@ -43,10 +34,16 @@ from ZODB.utils import p64
 from ZODB.utils import u64
 from ZODB.utils import z64
 
+import base64
+import logging
+import os
+import psycopg
+import shutil
+import sys
+import tempfile
+import time
 import zodb_json_codec
-
-from .interfaces import IPGJsonbStorage
-from .schema import install_schema
+import zope.interface
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +60,7 @@ class LoadCache:
     Thread-safety is not needed: each PGJsonbStorageInstance has its own.
     """
 
-    __slots__ = ("_data", "_size", "_max_size", "hits", "misses")
+    __slots__ = ("_data", "_max_size", "_size", "hits", "misses")
 
     def __init__(self, max_mb=DEFAULT_CACHE_LOCAL_MB):
         self._data = OrderedDict()  # zoid → (data, tid, entry_size)
@@ -127,8 +124,12 @@ class PGTransactionRecord(TransactionRecord):
 
 
 @zope.interface.implementer(
-    IPGJsonbStorage, IMVCCStorage, IBlobStorage, IStorageUndoable,
-    IStorageIteration, IStorageRestoreable,
+    IPGJsonbStorage,
+    IMVCCStorage,
+    IBlobStorage,
+    IStorageUndoable,
+    IStorageIteration,
+    IStorageRestoreable,
 )
 class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
     """ZODB storage that stores object state as JSONB in PostgreSQL.
@@ -147,10 +148,19 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
     direct use (without ZODB.DB).
     """
 
-    def __init__(self, dsn, name="pgjsonb", history_preserving=False,
-                 blob_temp_dir=None, cache_local_mb=DEFAULT_CACHE_LOCAL_MB,
-                 pool_size=1, pool_max_size=10,
-                 s3_client=None, blob_cache=None, blob_threshold=1_048_576):
+    def __init__(
+        self,
+        dsn,
+        name="pgjsonb",
+        history_preserving=False,
+        blob_temp_dir=None,
+        cache_local_mb=DEFAULT_CACHE_LOCAL_MB,
+        pool_size=1,
+        pool_max_size=10,
+        s3_client=None,
+        blob_cache=None,
+        blob_threshold=1_048_576,
+    ):
         BaseStorage.__init__(self, name)
         self._dsn = dsn
         self._history_preserving = history_preserving
@@ -159,8 +169,8 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         self._pack_tid = None  # Integer TID of last pack time
 
         # S3 tiered blob storage (optional)
-        self._s3_client = s3_client       # None = PG-only mode
-        self._blob_cache = blob_cache     # S3BlobCache for local caching
+        self._s3_client = s3_client  # None = PG-only mode
+        self._blob_cache = blob_cache  # S3BlobCache for local caching
         self._blob_threshold = blob_threshold  # bytes; blobs >= this go to S3
 
         # Pending stores for current transaction (direct use only)
@@ -187,7 +197,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         logger.debug("Connected to PostgreSQL")
 
         # Connection pool for MVCC instances (autocommit=True, dict_row)
-        logger.debug("Creating connection pool (min=%d, max=%d)", pool_size, pool_max_size)
+        logger.debug(
+            "Creating connection pool (min=%d, max=%d)", pool_size, pool_max_size
+        )
         self._instance_pool = ConnectionPool(
             dsn,
             min_size=pool_size,
@@ -210,17 +222,13 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
     def _restore_state(self):
         """Load max OID and last TID from existing data."""
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT COALESCE(MAX(zoid), 0) AS max_oid FROM object_state"
-            )
+            cur.execute("SELECT COALESCE(MAX(zoid), 0) AS max_oid FROM object_state")
             row = cur.fetchone()
             max_oid = row["max_oid"]
             if max_oid > 0:
                 self._oid = p64(max_oid)
 
-            cur.execute(
-                "SELECT COALESCE(MAX(tid), 0) AS max_tid FROM transaction_log"
-            )
+            cur.execute("SELECT COALESCE(MAX(tid), 0) AS max_tid FROM transaction_log")
             row = cur.fetchone()
             max_tid = row["max_tid"]
             if max_tid > 0:
@@ -259,7 +267,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         """
         with self._lock:
             now = time.time()
-            t = TimeStamp(*(time.gmtime(now)[:5] + (now % 60,)))
+            t = TimeStamp(*(*time.gmtime(now)[:5], now % 60))
             self._ts = t = t.laterThan(self._ts)
             return t.raw()
 
@@ -315,8 +323,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
 
         zoid = u64(oid)
         tid_int = u64(serial)
-        table = ("object_history" if self._history_preserving
-                 else "object_state")
+        table = "object_history" if self._history_preserving else "object_state"
         with self._conn.cursor() as cur:
             cur.execute(
                 f"SELECT class_mod, class_name, state "
@@ -358,29 +365,32 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 if committed_tid != serial:
                     committed_data = self.loadSerial(oid, committed_tid)
                     resolved = self.tryToResolveConflict(
-                        oid, committed_tid, serial, data,
+                        oid,
+                        committed_tid,
+                        serial,
+                        data,
                         committedData=committed_data,
                     )
                     if resolved:
                         data = resolved
                         self._resolved.append(oid)
                     else:
-                        raise ConflictError(
-                            oid=oid, serials=(committed_tid, serial)
-                        )
+                        raise ConflictError(oid=oid, serials=(committed_tid, serial))
 
-        class_mod, class_name, state, refs = (
-            zodb_json_codec.decode_zodb_record_for_pg(data)
+        class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
+            data
         )
 
-        self._tmp.append({
-            "zoid": zoid,
-            "class_mod": class_mod,
-            "class_name": class_name,
-            "state": state,
-            "state_size": len(data),
-            "refs": refs,
-        })
+        self._tmp.append(
+            {
+                "zoid": zoid,
+                "class_mod": class_mod,
+                "class_name": class_name,
+                "state": state,
+                "state_size": len(data),
+                "refs": refs,
+            }
+        )
 
     def checkCurrentSerialInTransaction(self, oid, serial, transaction):
         """Verify that the object's serial hasn't changed during this txn."""
@@ -388,15 +398,14 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             raise StorageTransactionError(self, transaction)
         zoid = u64(oid)
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT tid FROM object_state WHERE zoid = %s", (zoid,)
-            )
+            cur.execute("SELECT tid FROM object_state WHERE zoid = %s", (zoid,))
             row = cur.fetchone()
         if row is not None:
             current_serial = p64(row["tid"])
             if current_serial != serial:
                 raise ReadConflictError(
-                    oid=oid, serials=(current_serial, serial),
+                    oid=oid,
+                    serials=(current_serial, serial),
                 )
 
     # ── BaseStorage hooks (2PC) ──────────────────────────────────────
@@ -440,7 +449,10 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             _batch_write_objects(cur, writes, tid_int, hp)
             _batch_delete_objects(cur, deletes, tid_int, hp)
             _batch_write_blobs(
-                cur, self._blob_tmp, tid_int, hp,
+                cur,
+                self._blob_tmp,
+                tid_int,
+                hp,
                 s3_client=self._s3_client,
                 blob_threshold=self._blob_threshold,
             )
@@ -466,7 +478,8 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         with self._lock:
             if transaction is not self._transaction:
                 raise StorageTransactionError(
-                    "tpc_finish called with wrong transaction")
+                    "tpc_finish called with wrong transaction"
+                )
             try:
                 self._vote()  # idempotent — flushes if not already done
                 self._finish(self._tid, None, None, None)
@@ -519,8 +532,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         """Return approximate database size in bytes."""
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT COALESCE(SUM(state_size), 0) AS total "
-                "FROM object_state"
+                "SELECT COALESCE(SUM(state_size), 0) AS total FROM object_state"
             )
             row = cur.fetchone()
         return row["total"]
@@ -528,8 +540,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
     def history(self, oid, size=1):
         """Return revision history for an object."""
         zoid = u64(oid)
-        table = ("object_history" if self._history_preserving
-                 else "object_state")
+        table = "object_history" if self._history_preserving else "object_state"
         with self._conn.cursor() as cur:
             cur.execute(
                 f"SELECT o.tid, o.state_size, "
@@ -548,25 +559,26 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         result = []
         for row in rows:
             ts = TimeStamp(p64(row["tid"]))
-            result.append({
-                "time": ts.timeTime(),
-                "tid": p64(row["tid"]),
-                "serial": p64(row["tid"]),
-                "user_name": row["username"] or "",
-                "description": row["description"] or "",
-                "size": row["state_size"],
-            })
+            result.append(
+                {
+                    "time": ts.timeTime(),
+                    "tid": p64(row["tid"]),
+                    "serial": p64(row["tid"]),
+                    "user_name": row["username"] or "",
+                    "description": row["description"] or "",
+                    "size": row["state_size"],
+                }
+            )
         return result
 
     def pack(self, t, referencesf):
         """Pack the storage — remove unreachable objects and S3 blobs."""
         from .packer import pack as do_pack
+
         pack_time = None
         if self._history_preserving and t is not None:
             # Convert float timestamp to TID bytes
-            pack_time = TimeStamp(
-                *time.gmtime(t)[:5] + (t % 60,)
-            ).raw()
+            pack_time = TimeStamp(*(*time.gmtime(t)[:5], t % 60)).raw()
             self._pack_tid = u64(pack_time)
         _deleted_objects, _deleted_blobs, s3_keys = do_pack(
             self._conn,
@@ -587,7 +599,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         """Undo is only supported in history-preserving mode."""
         return self._history_preserving
 
-    def undoLog(self, first=0, last=-20, filter=None):
+    def undoLog(self, first=0, last=-20, filter=None):  # noqa: A002
         """Return a list of transaction descriptions for undo.
 
         Returns list of dicts: {id, time, user_name, description}.
@@ -595,10 +607,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         if not self._history_preserving:
             return []
 
-        if last < 0:
-            limit = -last
-        else:
-            limit = last - first
+        limit = -last if last < 0 else last - first
 
         with self._conn.cursor() as cur:
             if self._pack_tid is not None:
@@ -636,9 +645,10 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 "description": description,
             }
             # Merge extension metadata into the result dict
-            ext_data = row.get("extension") or b''
+            ext_data = row.get("extension") or b""
             if ext_data:
                 import json
+
                 if isinstance(ext_data, memoryview):
                     ext_data = bytes(ext_data)
                 try:
@@ -677,23 +687,25 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             oid_bytes = p64(item["zoid"])
             oid_list.append(oid_bytes)
             # Remove any existing entry for this zoid
-            self._tmp = [
-                e for e in self._tmp if e.get("zoid") != item["zoid"]
-            ]
+            self._tmp = [e for e in self._tmp if e.get("zoid") != item["zoid"]]
             if item["action"] == "delete":
-                self._tmp.append({
-                    "zoid": item["zoid"],
-                    "action": "delete",
-                })
+                self._tmp.append(
+                    {
+                        "zoid": item["zoid"],
+                        "action": "delete",
+                    }
+                )
             else:
-                self._tmp.append({
-                    "zoid": item["zoid"],
-                    "class_mod": item["class_mod"],
-                    "class_name": item["class_name"],
-                    "state": item["state"],
-                    "state_size": item["state_size"],
-                    "refs": item["refs"],
-                })
+                self._tmp.append(
+                    {
+                        "zoid": item["zoid"],
+                        "class_mod": item["class_mod"],
+                        "class_name": item["class_name"],
+                        "state": item["state"],
+                        "state_size": item["state_size"],
+                        "refs": item["refs"],
+                    }
+                )
 
         return self._tid, oid_list
 
@@ -711,8 +723,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         conn = self._instance_pool.getconn()
         try:
             conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
-            table = ("object_history" if self._history_preserving
-                     else "object_state")
+            table = "object_history" if self._history_preserving else "object_state"
             yield from _iter_transactions(conn, table, start, stop)
         finally:
             self._instance_pool.putconn(conn)
@@ -729,35 +740,35 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             raise StorageTransactionError(self, transaction)
         if data is None:
             return  # undo of object creation
-        class_mod, class_name, state, refs = (
-            zodb_json_codec.decode_zodb_record_for_pg(data)
+        class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
+            data
         )
-        self._tmp.append({
-            "zoid": u64(oid),
-            "class_mod": class_mod,
-            "class_name": class_name,
-            "state": state,
-            "state_size": len(data),
-            "refs": refs,
-        })
+        self._tmp.append(
+            {
+                "zoid": u64(oid),
+                "class_mod": class_mod,
+                "class_name": class_name,
+                "state": state,
+                "state_size": len(data),
+                "refs": refs,
+            }
+        )
 
-    def restoreBlob(self, oid, serial, data, blobfilename, prev_txn,
-                    transaction):
+    def restoreBlob(self, oid, serial, data, blobfilename, prev_txn, transaction):
         """Restore object data + blob without conflict checking."""
-        self.restore(oid, serial, data, '', prev_txn, transaction)
+        self.restore(oid, serial, data, "", prev_txn, transaction)
         if blobfilename is not None:
             self._blob_tmp.append((u64(oid), blobfilename))
 
     # ── IBlobStorage ─────────────────────────────────────────────────
 
-    def storeBlob(self, oid, oldserial, data, blobfilename, version,
-                  transaction):
+    def storeBlob(self, oid, oldserial, data, blobfilename, version, transaction):
         """Store object data + blob file (direct-use path)."""
         if transaction is not self._transaction:
             raise StorageTransactionError(self, transaction)
         if version:
             raise TypeError("versions are not supported")
-        self.store(oid, oldserial, data, '', transaction)
+        self.store(oid, oldserial, data, "", transaction)
         self._blob_tmp.append((u64(oid), blobfilename))
 
     def loadBlob(self, oid, serial):
@@ -768,9 +779,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         """
         zoid = u64(oid)
         tid_int = u64(serial)
-        path = os.path.join(
-            self._blob_temp_dir, f"{zoid:016x}-{tid_int:016x}.blob"
-        )
+        path = os.path.join(self._blob_temp_dir, f"{zoid:016x}-{tid_int:016x}.blob")
         if os.path.exists(path):
             return path
         # Check S3 blob cache before hitting the database
@@ -780,8 +789,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 return cached
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT data, s3_key FROM blob_state "
-                "WHERE zoid = %s AND tid = %s",
+                "SELECT data, s3_key FROM blob_state WHERE zoid = %s AND tid = %s",
                 (zoid, tid_int),
             )
             row = cur.fetchone()
@@ -789,8 +797,12 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             raise POSKeyError(oid)
         if row["s3_key"]:
             return _load_blob_from_s3(
-                self._s3_client, self._blob_cache,
-                row["s3_key"], oid, serial, path,
+                self._s3_client,
+                self._blob_cache,
+                row["s3_key"],
+                oid,
+                serial,
+                path,
             )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
@@ -803,9 +815,10 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         """Open committed blob file for reading."""
         blob_path = self.loadBlob(oid, serial)
         if blob is None:
-            return open(blob_path, 'rb')
+            return open(blob_path, "rb")
         from ZODB.blob import BlobFile
-        return BlobFile(blob_path, 'r', blob)
+
+        return BlobFile(blob_path, "r", blob)
 
     def temporaryDirectory(self):
         """Return directory for uncommitted blob data."""
@@ -899,9 +912,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         All subsequent load()/loadBefore() queries will see a consistent
         point-in-time snapshot until _end_read_txn() is called.
         """
-        self._conn.execute(
-            "BEGIN ISOLATION LEVEL REPEATABLE READ"
-        )
+        self._conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         self._in_read_txn = True
 
     def poll_invalidations(self):
@@ -924,10 +935,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         self._begin_read_txn()
 
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT COALESCE(MAX(tid), 0) AS max_tid "
-                "FROM transaction_log"
-            )
+            cur.execute("SELECT COALESCE(MAX(tid), 0) AS max_tid FROM transaction_log")
             row = cur.fetchone()
             new_tid = row["max_tid"]
 
@@ -1007,8 +1015,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
 
         zoid = u64(oid)
         tid_int = u64(serial)
-        table = ("object_history" if self._history_preserving
-                 else "object_state")
+        table = "object_history" if self._history_preserving else "object_state"
         with self._conn.cursor() as cur:
             cur.execute(
                 f"SELECT class_mod, class_name, state "
@@ -1055,33 +1062,36 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
                 if committed_tid != serial:
                     committed_data = self.loadSerial(oid, committed_tid)
                     resolved = self.tryToResolveConflict(
-                        oid, committed_tid, serial, data,
+                        oid,
+                        committed_tid,
+                        serial,
+                        data,
                         committedData=committed_data,
                     )
                     if resolved:
                         data = resolved
                         self._resolved.append(oid)
                     else:
-                        raise ConflictError(
-                            oid=oid, serials=(committed_tid, serial)
-                        )
+                        raise ConflictError(oid=oid, serials=(committed_tid, serial))
 
-        class_mod, class_name, state, refs = (
-            zodb_json_codec.decode_zodb_record_for_pg(data)
+        class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
+            data
         )
 
-        self._tmp.append({
-            "zoid": zoid,
-            "class_mod": class_mod,
-            "class_name": class_name,
-            "state": state,
-            "state_size": len(data),
-            "refs": refs,
-        })
+        self._tmp.append(
+            {
+                "zoid": zoid,
+                "class_mod": class_mod,
+                "class_name": class_name,
+                "state": state,
+                "state_size": len(data),
+                "refs": refs,
+            }
+        )
 
     # ── 2PC ──────────────────────────────────────────────────────────
 
-    def tpc_begin(self, transaction, tid=None, status=' '):
+    def tpc_begin(self, transaction, tid=None, status=" "):
         """Begin a two-phase commit.
 
         Ends any active read snapshot, starts an explicit PG transaction,
@@ -1131,7 +1141,10 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             _batch_write_objects(cur, writes, tid_int, hp)
             _batch_delete_objects(cur, deletes, tid_int, hp)
             _batch_write_blobs(
-                cur, self._blob_tmp, tid_int, hp,
+                cur,
+                self._blob_tmp,
+                tid_int,
+                hp,
                 s3_client=self._s3_client,
                 blob_threshold=self._blob_threshold,
             )
@@ -1170,27 +1183,25 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             raise StorageTransactionError(self, transaction)
         zoid = u64(oid)
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT tid FROM object_state WHERE zoid = %s", (zoid,)
-            )
+            cur.execute("SELECT tid FROM object_state WHERE zoid = %s", (zoid,))
             row = cur.fetchone()
         if row is not None:
             current_serial = p64(row["tid"])
             if current_serial != serial:
                 raise ReadConflictError(
-                    oid=oid, serials=(current_serial, serial),
+                    oid=oid,
+                    serials=(current_serial, serial),
                 )
 
     # ── IBlobStorage ─────────────────────────────────────────────────
 
-    def storeBlob(self, oid, oldserial, data, blobfilename, version,
-                  transaction):
+    def storeBlob(self, oid, oldserial, data, blobfilename, version, transaction):
         """Store object data + blob file."""
         if transaction is not self._transaction:
             raise StorageTransactionError(self, transaction)
         if version:
             raise TypeError("versions are not supported")
-        self.store(oid, oldserial, data, '', transaction)
+        self.store(oid, oldserial, data, "", transaction)
         self._blob_tmp.append((u64(oid), blobfilename))
 
     def loadBlob(self, oid, serial):
@@ -1201,9 +1212,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         """
         zoid = u64(oid)
         tid_int = u64(serial)
-        path = os.path.join(
-            self._blob_temp_dir, f"{zoid:016x}-{tid_int:016x}.blob"
-        )
+        path = os.path.join(self._blob_temp_dir, f"{zoid:016x}-{tid_int:016x}.blob")
         if os.path.exists(path):
             return path
         # Check S3 blob cache before hitting the database
@@ -1213,8 +1222,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
                 return cached
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT data, s3_key FROM blob_state "
-                "WHERE zoid = %s AND tid = %s",
+                "SELECT data, s3_key FROM blob_state WHERE zoid = %s AND tid = %s",
                 (zoid, tid_int),
             )
             row = cur.fetchone()
@@ -1222,8 +1230,12 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             raise POSKeyError(oid)
         if row["s3_key"]:
             return _load_blob_from_s3(
-                self._s3_client, self._blob_cache,
-                row["s3_key"], oid, serial, path,
+                self._s3_client,
+                self._blob_cache,
+                row["s3_key"],
+                oid,
+                serial,
+                path,
             )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
@@ -1236,9 +1248,10 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         """Open committed blob file for reading."""
         blob_path = self.loadBlob(oid, serial)
         if blob is None:
-            return open(blob_path, 'rb')
+            return open(blob_path, "rb")
         from ZODB.blob import BlobFile
-        return BlobFile(blob_path, 'r', blob)
+
+        return BlobFile(blob_path, "r", blob)
 
     def temporaryDirectory(self):
         """Return directory for uncommitted blob data."""
@@ -1277,7 +1290,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
     def supportsUndo(self):
         return self._main.supportsUndo()
 
-    def undoLog(self, first=0, last=-20, filter=None):
+    def undoLog(self, first=0, last=-20, filter=None):  # noqa: A002
         return self._main.undoLog(first, last, filter)
 
     def undoInfo(self, first=0, last=-20, specification=None):
@@ -1298,23 +1311,25 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             oid_bytes = p64(item["zoid"])
             oid_list.append(oid_bytes)
             # Remove any existing entry for this zoid
-            self._tmp = [
-                e for e in self._tmp if e.get("zoid") != item["zoid"]
-            ]
+            self._tmp = [e for e in self._tmp if e.get("zoid") != item["zoid"]]
             if item["action"] == "delete":
-                self._tmp.append({
-                    "zoid": item["zoid"],
-                    "action": "delete",
-                })
+                self._tmp.append(
+                    {
+                        "zoid": item["zoid"],
+                        "action": "delete",
+                    }
+                )
             else:
-                self._tmp.append({
-                    "zoid": item["zoid"],
-                    "class_mod": item["class_mod"],
-                    "class_name": item["class_name"],
-                    "state": item["state"],
-                    "state_size": item["state_size"],
-                    "refs": item["refs"],
-                })
+                self._tmp.append(
+                    {
+                        "zoid": item["zoid"],
+                        "class_mod": item["class_mod"],
+                        "class_name": item["class_name"],
+                        "state": item["state"],
+                        "state_size": item["state_size"],
+                        "refs": item["refs"],
+                    }
+                )
 
         return self._tid, oid_list
 
@@ -1326,22 +1341,23 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             raise StorageTransactionError(self, transaction)
         if data is None:
             return
-        class_mod, class_name, state, refs = (
-            zodb_json_codec.decode_zodb_record_for_pg(data)
+        class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
+            data
         )
-        self._tmp.append({
-            "zoid": u64(oid),
-            "class_mod": class_mod,
-            "class_name": class_name,
-            "state": state,
-            "state_size": len(data),
-            "refs": refs,
-        })
+        self._tmp.append(
+            {
+                "zoid": u64(oid),
+                "class_mod": class_mod,
+                "class_name": class_name,
+                "state": state,
+                "state_size": len(data),
+                "refs": refs,
+            }
+        )
 
-    def restoreBlob(self, oid, serial, data, blobfilename, prev_txn,
-                    transaction):
+    def restoreBlob(self, oid, serial, data, blobfilename, prev_txn, transaction):
         """Restore object data + blob without conflict checking."""
-        self.restore(oid, serial, data, '', prev_txn, transaction)
+        self.restore(oid, serial, data, "", prev_txn, transaction)
         if blobfilename is not None:
             self._blob_tmp.append((u64(oid), blobfilename))
 
@@ -1361,10 +1377,11 @@ def _serialize_extension(ext):
         return ext
     if isinstance(ext, dict):
         if not ext:
-            return b''
+            return b""
         import json
-        return json.dumps(ext).encode('utf-8')
-    return b''
+
+        return json.dumps(ext).encode("utf-8")
+    return b""
 
 
 def _write_txn_log(cur, tid_int, user, desc, ext):
@@ -1475,20 +1492,24 @@ def _compute_undo(cur, tid_int, storage, pending=None):
                 # The TID changed (from a prior undo) but data is the same.
                 # Treat as simple undo: restore previous revision.
                 if prev is None:
-                    undo_data.append({
-                        "zoid": zoid,
-                        "action": "delete",
-                    })
+                    undo_data.append(
+                        {
+                            "zoid": zoid,
+                            "action": "delete",
+                        }
+                    )
                 else:
-                    undo_data.append({
-                        "zoid": zoid,
-                        "action": "restore",
-                        "class_mod": prev["class_mod"],
-                        "class_name": prev["class_name"],
-                        "state": prev["state"],
-                        "state_size": prev["state_size"],
-                        "refs": prev["refs"],
-                    })
+                    undo_data.append(
+                        {
+                            "zoid": zoid,
+                            "action": "restore",
+                            "class_mod": prev["class_mod"],
+                            "class_name": prev["class_name"],
+                            "state": prev["state"],
+                            "state_size": prev["state_size"],
+                            "refs": prev["refs"],
+                        }
+                    )
             else:
                 # States genuinely differ — requires conflict resolution
                 oid_bytes = p64(zoid)
@@ -1506,18 +1527,14 @@ def _compute_undo(cur, tid_int, storage, pending=None):
                     "@cls": [prev["class_mod"], prev["class_name"]],
                     "@s": _unsanitize_from_pg(prev["state"]),
                 }
-                pre_undo_data = zodb_json_codec.encode_zodb_record(
-                    pre_undo_record
-                )
+                pre_undo_data = zodb_json_codec.encode_zodb_record(pre_undo_record)
 
                 # Get current state as pickle
                 current_record = {
                     "@cls": [cur_row["class_mod"], cur_row["class_name"]],
                     "@s": _unsanitize_from_pg(cur_row["state"]),
                 }
-                current_data = zodb_json_codec.encode_zodb_record(
-                    current_record
-                )
+                current_data = zodb_json_codec.encode_zodb_record(current_record)
 
                 # Try conflict resolution
                 try:
@@ -1527,46 +1544,50 @@ def _compute_undo(cur, tid_int, storage, pending=None):
                         current_data,
                         pre_undo_data,
                     )
-                except ConflictError:
+                except ConflictError as err:
                     raise UndoError(
                         f"Can't undo: conflict on object {zoid:#x}"
-                    )
+                    ) from err
 
                 if resolved is None:
-                    raise UndoError(
-                        f"Can't undo: conflict on object {zoid:#x}"
-                    )
+                    raise UndoError(f"Can't undo: conflict on object {zoid:#x}")
 
                 # Decode resolved pickle back to JSONB
                 r_mod, r_name, r_state, r_refs = (
                     zodb_json_codec.decode_zodb_record_for_pg(resolved)
                 )
-                undo_data.append({
-                    "zoid": zoid,
-                    "action": "restore",
-                    "class_mod": r_mod,
-                    "class_name": r_name,
-                    "state": r_state,
-                    "state_size": len(resolved),
-                    "refs": r_refs,
-                })
+                undo_data.append(
+                    {
+                        "zoid": zoid,
+                        "action": "restore",
+                        "class_mod": r_mod,
+                        "class_name": r_name,
+                        "state": r_state,
+                        "state_size": len(resolved),
+                        "refs": r_refs,
+                    }
+                )
         elif prev is None:
             # Object was created in this txn — delete it
-            undo_data.append({
-                "zoid": zoid,
-                "action": "delete",
-            })
+            undo_data.append(
+                {
+                    "zoid": zoid,
+                    "action": "delete",
+                }
+            )
         else:
             # Simple undo: restore previous revision
-            undo_data.append({
-                "zoid": zoid,
-                "action": "restore",
-                "class_mod": prev["class_mod"],
-                "class_name": prev["class_name"],
-                "state": prev["state"],
-                "state_size": prev["state_size"],
-                "refs": prev["refs"],
-            })
+            undo_data.append(
+                {
+                    "zoid": zoid,
+                    "action": "restore",
+                    "class_mod": prev["class_mod"],
+                    "class_name": prev["class_name"],
+                    "state": prev["state"],
+                    "state_size": prev["state_size"],
+                    "refs": prev["refs"],
+                }
+            )
 
     return undo_data
 
@@ -1634,8 +1655,14 @@ def _batch_delete_objects(cur, zoids, tid_int, history_preserving=False):
     )
 
 
-def _batch_write_blobs(cur, blobs, tid_int, history_preserving=False,
-                       s3_client=None, blob_threshold=1_048_576):
+def _batch_write_blobs(
+    cur,
+    blobs,
+    tid_int,
+    history_preserving=False,
+    s3_client=None,
+    blob_threshold=1_048_576,
+):
     """Write multiple blobs in batch with optional S3 tiering.
 
     When s3_client is set, blobs >= blob_threshold are uploaded to S3
@@ -1645,8 +1672,8 @@ def _batch_write_blobs(cur, blobs, tid_int, history_preserving=False,
     if not blobs:
         return
 
-    pg_params = []      # (zoid, tid, size, data) — PG bytea blobs
-    s3_params = []      # (zoid, tid, size, s3_key) — S3 metadata-only rows
+    pg_params = []  # (zoid, tid, size, data) — PG bytea blobs
+    s3_params = []  # (zoid, tid, size, s3_key) — S3 metadata-only rows
 
     for zoid, blob_path in blobs:
         size = os.path.getsize(blob_path)
@@ -1658,7 +1685,7 @@ def _batch_write_blobs(cur, blobs, tid_int, history_preserving=False,
             os.unlink(blob_path)
         else:
             # Small blob or no S3 → PG bytea
-            with open(blob_path, 'rb') as f:
+            with open(blob_path, "rb") as f:
                 blob_data = f.read()
             pg_params.append((zoid, tid_int, size, blob_data))
             os.unlink(blob_path)
@@ -1726,8 +1753,7 @@ def _loadBefore_hf(cur, oid, zoid, tid_int):
     object_state).  Return it if its tid < requested tid, else None.
     """
     cur.execute(
-        "SELECT tid, class_mod, class_name, state "
-        "FROM object_state WHERE zoid = %s",
+        "SELECT tid, class_mod, class_name, state FROM object_state WHERE zoid = %s",
         (zoid,),
     )
     row = cur.fetchone()
@@ -1771,8 +1797,7 @@ def _loadBefore_hp(cur, oid, zoid, tid_int):
     start_tid = p64(row["tid"])
     # Find end_tid: next revision's tid
     cur.execute(
-        "SELECT MIN(tid) AS next_tid FROM object_history "
-        "WHERE zoid = %s AND tid > %s",
+        "SELECT MIN(tid) AS next_tid FROM object_history WHERE zoid = %s AND tid > %s",
         (zoid, row["tid"]),
     )
     next_row = cur.fetchone()
@@ -1789,7 +1814,8 @@ def _unsanitize_from_pg(obj):
     if isinstance(obj, dict):
         if "@ns" in obj and len(obj) == 1:
             return base64.b64decode(obj["@ns"]).decode(
-                'utf-8', errors='surrogatepass',
+                "utf-8",
+                errors="surrogatepass",
             )
         new = {}
         changed = False
@@ -1867,18 +1893,20 @@ def _iter_transactions(conn, table, start, stop):
                         "@s": _unsanitize_from_pg(obj_row["state"]),
                     }
                     data = zodb_json_codec.encode_zodb_record(record)
-                records.append(DataRecord(
-                    p64(obj_row["zoid"]),
-                    tid_bytes,
-                    data,
-                    None,
-                ))
+                records.append(
+                    DataRecord(
+                        p64(obj_row["zoid"]),
+                        tid_bytes,
+                        data,
+                        None,
+                    )
+                )
 
             yield PGTransactionRecord(
                 tid_bytes,
-                ' ',
-                txn_row["username"] or '',
-                txn_row["description"] or '',
-                txn_row["extension"] or b'',
+                " ",
+                txn_row["username"] or "",
+                txn_row["description"] or "",
+                txn_row["extension"] or b"",
                 records,
             )

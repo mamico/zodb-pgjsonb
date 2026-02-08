@@ -6,27 +6,26 @@ objects through the standard ZODB.DB/Connection API.
 Requires PostgreSQL on localhost:5433.
 """
 
-import pytest
-
-import transaction as txn
-
-import ZODB
-
 from persistent.mapping import PersistentMapping
-
+from tests.conftest import DSN
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-from tests.conftest import DSN
+import pytest
+import transaction as txn
+import ZODB
 
 
 @pytest.fixture
 def storage():
     """Fresh PGJsonbStorage with clean database."""
     import psycopg
+
     # Clean slate
     conn = psycopg.connect(DSN)
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS blob_state, object_state, transaction_log CASCADE")
+        cur.execute(
+            "DROP TABLE IF EXISTS blob_state, object_state, transaction_log CASCADE"
+        )
     conn.commit()
     conn.close()
 
@@ -167,6 +166,7 @@ class TestZODBIntegration:
     def test_last_transaction(self, storage, db):
         """lastTransaction returns the TID of the last commit."""
         from ZODB.utils import z64
+
         # Before any user commit, DB has created root
         assert storage.lastTransaction() != z64
 
@@ -186,8 +186,9 @@ class TestZODBIntegration:
 
     def test_jsonb_stored_correctly(self, db):
         """Verify that JSONB is actually stored in PostgreSQL."""
-        import psycopg
         from psycopg.rows import dict_row
+
+        import psycopg
 
         conn = db.open()
         root = conn.root()
@@ -200,7 +201,9 @@ class TestZODBIntegration:
         pg_conn = psycopg.connect(DSN, row_factory=dict_row)
         with pg_conn.cursor() as cur:
             # Root object is at zoid=0
-            cur.execute("SELECT class_mod, class_name, state FROM object_state WHERE zoid = 0")
+            cur.execute(
+                "SELECT class_mod, class_name, state FROM object_state WHERE zoid = 0"
+            )
             row = cur.fetchone()
         pg_conn.close()
 
@@ -214,8 +217,9 @@ class TestZODBIntegration:
 
     def test_refs_populated(self, db):
         """Verify refs column is populated for persistent references."""
-        import psycopg
         from psycopg.rows import dict_row
+
+        import psycopg
 
         conn = db.open()
         root = conn.root()

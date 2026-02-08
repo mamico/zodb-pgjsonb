@@ -42,6 +42,7 @@ test = [
     "coverage[toml]>=7.0",
     "testcontainers[postgres]",
     "moto[s3]>=4.0",
+    "zope.testing",
 ]
 bench = [
     "relstorage>=4.0",

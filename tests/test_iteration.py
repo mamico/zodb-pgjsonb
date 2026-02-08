@@ -6,24 +6,17 @@ and restore for zodbconvert compatibility.
 Requires PostgreSQL on localhost:5433.
 """
 
-import pytest
-
-import transaction as txn
-
-import ZODB
+from persistent.mapping import PersistentMapping
+from tests.conftest import DSN
 from ZODB.interfaces import IStorageIteration
 from ZODB.interfaces import IStorageRestoreable
 from ZODB.utils import p64
-from ZODB.utils import u64
-from ZODB.utils import z64
-
-import zodb_json_codec
-
-from persistent.mapping import PersistentMapping
-
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-from tests.conftest import DSN
+import pytest
+import transaction as txn
+import ZODB
+import zodb_json_codec
 
 
 def _clean_db():
@@ -116,7 +109,7 @@ class TestIterator:
             assert r.oid is not None
             assert r.tid is not None
             assert r.data is not None
-            assert r.version == ''
+            assert r.version == ""
 
     def test_iterator_data_is_valid_pickle(self, db, storage):
         """Iterator records contain valid pickle bytes (decodable)."""
@@ -137,7 +130,7 @@ class TestIterator:
         root = conn.root()
         root["v1"] = 1
         txn.commit()
-        tid1 = storage.lastTransaction()
+        _tid1 = storage.lastTransaction()
 
         root["v2"] = 2
         txn.commit()
@@ -230,9 +223,9 @@ class TestRestore:
 
         from ZODB.BaseStorage import TransactionRecord
 
-        txn_meta = TransactionRecord(tid, ' ', '', '', b'')
+        txn_meta = TransactionRecord(tid, " ", "", "", b"")
         storage.tpc_begin(txn_meta, tid)
-        storage.restore(oid, tid, data, '', None, txn_meta)
+        storage.restore(oid, tid, data, "", None, txn_meta)
         storage.tpc_vote(txn_meta)
         storage.tpc_finish(txn_meta)
 
@@ -248,13 +241,14 @@ class TestRestore:
 
         from ZODB.BaseStorage import TransactionRecord
 
-        txn_meta = TransactionRecord(tid, ' ', '', '', b'')
+        txn_meta = TransactionRecord(tid, " ", "", "", b"")
         storage.tpc_begin(txn_meta, tid)
-        storage.restore(oid, tid, None, '', None, txn_meta)
+        storage.restore(oid, tid, None, "", None, txn_meta)
         storage.tpc_vote(txn_meta)
         storage.tpc_finish(txn_meta)
 
         from ZODB.POSException import POSKeyError
+
         with pytest.raises(POSKeyError):
             storage.load(oid)
 
@@ -271,9 +265,9 @@ class TestRestore:
         from ZODB.BaseStorage import TransactionRecord
 
         # First restore
-        txn1 = TransactionRecord(tid1, ' ', '', '', b'')
+        txn1 = TransactionRecord(tid1, " ", "", "", b"")
         storage.tpc_begin(txn1, tid1)
-        storage.restore(oid, tid1, data, '', None, txn1)
+        storage.restore(oid, tid1, data, "", None, txn1)
         storage.tpc_vote(txn1)
         storage.tpc_finish(txn1)
 
@@ -284,9 +278,9 @@ class TestRestore:
         }
         data2 = zodb_json_codec.encode_zodb_record(record2)
         tid2 = p64(2)
-        txn2 = TransactionRecord(tid2, ' ', '', '', b'')
+        txn2 = TransactionRecord(tid2, " ", "", "", b"")
         storage.tpc_begin(txn2, tid2)
-        storage.restore(oid, tid2, data2, '', None, txn2)
+        storage.restore(oid, tid2, data2, "", None, txn2)
         storage.tpc_vote(txn2)
         storage.tpc_finish(txn2)
 
@@ -309,13 +303,13 @@ class TestRestore:
         try:
             from ZODB.BaseStorage import TransactionRecord
 
-            txn_meta = TransactionRecord(tid, ' ', '', '', b'')
+            txn_meta = TransactionRecord(tid, " ", "", "", b"")
             inst.tpc_begin(txn_meta, tid)
-            inst.restore(oid, tid, data, '', None, txn_meta)
+            inst.restore(oid, tid, data, "", None, txn_meta)
             inst.tpc_vote(txn_meta)
             inst.tpc_finish(txn_meta)
 
-            loaded_data, loaded_tid = inst.load(oid)
+            _loaded_data, loaded_tid = inst.load(oid)
             assert loaded_tid == tid
         finally:
             inst.release()
@@ -344,14 +338,16 @@ class TestCopyViaIteratorAndRestore:
         collected = []
         for t in src.iterator():
             recs = [(r.oid, r.tid, r.data, r.data_txn) for r in t]
-            collected.append({
-                "tid": t.tid,
-                "status": t.status,
-                "user": t.user,
-                "description": t.description,
-                "extension_bytes": t.extension_bytes,
-                "records": recs,
-            })
+            collected.append(
+                {
+                    "tid": t.tid,
+                    "status": t.status,
+                    "user": t.user,
+                    "description": t.description,
+                    "extension_bytes": t.extension_bytes,
+                    "records": recs,
+                }
+            )
         src.close()
 
         assert len(collected) >= 1
@@ -363,12 +359,15 @@ class TestCopyViaIteratorAndRestore:
 
         for t in collected:
             txn_meta = TransactionRecord(
-                t["tid"], t["status"], t["user"],
-                t["description"], t["extension_bytes"],
+                t["tid"],
+                t["status"],
+                t["user"],
+                t["description"],
+                t["extension_bytes"],
             )
             dst.tpc_begin(txn_meta, t["tid"], t["status"])
             for oid, tid, data, data_txn in t["records"]:
-                dst.restore(oid, tid, data, '', data_txn, txn_meta)
+                dst.restore(oid, tid, data, "", data_txn, txn_meta)
             dst.tpc_vote(txn_meta)
             dst.tpc_finish(txn_meta)
 

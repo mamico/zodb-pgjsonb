@@ -1,10 +1,10 @@
 """BlobManager — Tiered blob storage (PG bytea + optional S3)."""
 
+from ZODB.utils import oid_repr
+
 import logging
 import os
 import tempfile
-
-from ZODB.utils import oid_repr
 
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,9 @@ class BlobManager:
                 "VALUES (%s, %s, %s, %s)",
                 (zoid, ztid, size, s3_key),
             )
-            logger.debug("Stored blob %s/%s in S3 (%d bytes)", _oid_hex(oid), _tid_hex(tid), size)
+            logger.debug(
+                "Stored blob %s/%s in S3 (%d bytes)", _oid_hex(oid), _tid_hex(tid), size
+            )
         else:
             with open(blob_path, "rb") as f:
                 data = f.read()
@@ -66,7 +68,9 @@ class BlobManager:
                 "VALUES (%s, %s, %s, %s)",
                 (zoid, ztid, size, data),
             )
-            logger.debug("Stored blob %s/%s in PG (%d bytes)", _oid_hex(oid), _tid_hex(tid), size)
+            logger.debug(
+                "Stored blob %s/%s in PG (%d bytes)", _oid_hex(oid), _tid_hex(tid), size
+            )
 
     def load_blob(self, cursor, oid, tid):
         """Load a blob, returning a local file path."""
@@ -83,6 +87,7 @@ class BlobManager:
 
         if row is None:
             from ZODB.POSException import POSKeyError
+
             raise POSKeyError(oid)
 
         if row[1]:  # s3_key

@@ -1,11 +1,10 @@
 """InvalidationChannel — LISTEN/NOTIFY for instant cache invalidation."""
 
-import logging
-import threading
-
-import psycopg
-
 from ZODB.utils import p64
+
+import logging
+import psycopg
+import threading
 
 
 logger = logging.getLogger(__name__)
@@ -48,8 +47,7 @@ class InvalidationChannel:
         max_tid = max(notifications)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT zoid FROM object_state "
-                "WHERE tid > %s AND tid <= %s",
+                "SELECT DISTINCT zoid FROM object_state WHERE tid > %s AND tid <= %s",
                 (self._last_tid, max_tid),
             )
             rows = cur.fetchall()

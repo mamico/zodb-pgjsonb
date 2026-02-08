@@ -8,20 +8,15 @@ Tests that PGJsonbStorage correctly handles conflict resolution:
 Requires PostgreSQL on localhost:5433.
 """
 
-import pytest
-
-import transaction as txn
-
-import ZODB
-from ZODB.POSException import ConflictError
-
 from BTrees.OOBTree import OOBTree
-
 from persistent.mapping import PersistentMapping
-
+from tests.conftest import DSN
+from ZODB.POSException import ConflictError
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-from tests.conftest import DSN
+import pytest
+import transaction as txn
+import ZODB
 
 
 @pytest.fixture
@@ -209,10 +204,12 @@ class TestTransformHooks:
 
     def test_instance_hooks_after_registerDB(self, storage):
         """After manual registerDB, new instances get the stored hooks."""
+
         # Simulate a DB wrapper that could set custom transforms
         class MockDB:
             def transform_record_data(self, data):
                 return data
+
             def untransform_record_data(self, data):
                 return data
 
@@ -220,8 +217,5 @@ class TestTransformHooks:
 
         inst = storage.new_instance()
         # After registerDB sets instance attrs, they propagate to instances
-        assert (
-            inst._crs_transform_record_data
-            is storage._crs_transform_record_data
-        )
+        assert inst._crs_transform_record_data is storage._crs_transform_record_data
         inst.release()

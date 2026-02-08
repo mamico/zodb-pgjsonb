@@ -5,9 +5,10 @@ to extract references, we use the pre-extracted `refs` column for a
 server-side recursive CTE query. No data leaves PostgreSQL during pack.
 """
 
+from ZODB.utils import u64
+
 import logging
 
-from ZODB.utils import u64
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +46,7 @@ def pack(conn, pack_time=None, history_preserving=False):
 
     with conn.cursor() as cur:
         # Phase 1: Find reachable objects
-        cur.execute(
-            f"SELECT zoid INTO TEMP reachable_oids "
-            f"FROM ({REACHABLE_QUERY}) q"
-        )
+        cur.execute(f"SELECT zoid INTO TEMP reachable_oids FROM ({REACHABLE_QUERY}) q")
         cur.execute("CREATE INDEX ON reachable_oids (zoid)")
 
         # Phase 2: Delete unreachable objects
@@ -164,7 +162,7 @@ def pack(conn, pack_time=None, history_preserving=False):
         # Phase 5: Clean up transaction_log entries at or before pack_time
         # that are no longer referenced by object_state (FK constraint).
         # These transactions are no longer undoable after pack.
-        deleted_txns = 0
+        _deleted_txns = 0
         if history_preserving and pack_tid is not None:
             cur.execute(
                 "DELETE FROM transaction_log t "
@@ -175,7 +173,7 @@ def pack(conn, pack_time=None, history_preserving=False):
                 ")",
                 (pack_tid,),
             )
-            deleted_txns = cur.rowcount
+            _deleted_txns = cur.rowcount
 
         # Cleanup temp table
         cur.execute("DROP TABLE reachable_oids")
