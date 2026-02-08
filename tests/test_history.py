@@ -291,8 +291,8 @@ class TestUndoInterface:
         log = hp_storage.undoLog(0, -20)
         assert len(log) >= 2
         # Latest transaction first
-        assert log[0]["description"] == "change 2"
-        assert log[1]["description"] == "change 1"
+        assert log[0]["description"] == b"change 2"
+        assert log[1]["description"] == b"change 1"
 
     def test_undo_log_with_filter(self, hp_db, hp_storage):
         conn = hp_db.open()
@@ -308,9 +308,9 @@ class TestUndoInterface:
 
         log = hp_storage.undoLog(
             0, -20,
-            filter=lambda d: d["description"] == "keep"
+            filter=lambda d: d["description"] == b"keep"
         )
-        assert all(d["description"] == "keep" for d in log)
+        assert all(d["description"] == b"keep" for d in log)
 
     def test_undo_info_works(self, hp_db, hp_storage):
         """UndoLogCompatible mixin provides undoInfo()."""

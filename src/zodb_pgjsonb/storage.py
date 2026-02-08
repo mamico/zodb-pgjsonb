@@ -87,6 +87,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         self._dsn = dsn
         self._history_preserving = history_preserving
         self._ltid = z64
+        self._pack_tid = None  # Integer TID of last pack time
 
         # Pending stores for current transaction (direct use only)
         self._tmp = []
@@ -302,11 +303,22 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
 
     def _begin(self, tid, u, d, e):
         """Called by BaseStorage.tpc_begin after acquiring commit lock."""
+        self._ude = (u, d, e)
+        self._voted = False
         self._conn.execute("BEGIN")
         self._conn.execute("SELECT pg_advisory_xact_lock(0)")
 
     def _vote(self):
-        """Called by BaseStorage.tpc_vote — flush pending stores + blobs."""
+        """Flush pending stores + blobs to PostgreSQL.
+
+        Called by BaseStorage.tpc_vote, and also from tpc_finish to handle
+        cases where tpc_vote is skipped (e.g. undo → tpc_finish).
+        Idempotent: only flushes once per transaction.
+        """
+        if self._voted:
+            return None
+        self._voted = True
+
         tid_int = u64(self._tid)
         hp = self._history_preserving
 
@@ -317,7 +329,10 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             _write_txn_log(cur, tid_int, user, desc, e)
 
             for obj in self._tmp:
-                _write_object(cur, obj, tid_int, hp)
+                if obj.get("action") == "delete":
+                    _delete_object(cur, obj["zoid"], tid_int, hp)
+                else:
+                    _write_object(cur, obj, tid_int, hp)
 
             for zoid, blob_path in self._blob_tmp:
                 _write_blob(cur, zoid, tid_int, blob_path, hp)
@@ -333,6 +348,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         the PG COMMIT — so other threads would see stale data during the
         callback.
 
+        Also ensures _vote() is called if tpc_vote was skipped (e.g.
+        undo → tpc_finish without explicit tpc_vote).
+
         The callback runs AFTER the lock is released so that concurrent
         readers (lastTransaction, getTid) can proceed during the callback.
         This is safe because commit + _ltid are already done.
@@ -342,8 +360,8 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 raise StorageTransactionError(
                     "tpc_finish called with wrong transaction")
             try:
-                u, d, e = self._ude
-                self._finish(self._tid, u, d, e)
+                self._vote()  # idempotent — flushes if not already done
+                self._finish(self._tid, None, None, None)
             finally:
                 self._clear_temp()
                 self._ude = None
@@ -409,7 +427,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 f"SELECT o.tid, o.state_size, "
                 f"t.username, t.description "
                 f"FROM {table} o "
-                f"JOIN transaction_log t ON o.tid = t.tid "
+                f"LEFT JOIN transaction_log t ON o.tid = t.tid "
                 f"WHERE o.zoid = %s "
                 f"ORDER BY o.tid DESC LIMIT %s",
                 (zoid, size),
@@ -441,6 +459,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             pack_time = TimeStamp(
                 *time.gmtime(t)[:5] + (t % 60,)
             ).raw()
+            self._pack_tid = u64(pack_time)
         do_pack(
             self._conn,
             pack_time=pack_time,
@@ -462,26 +481,57 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             return []
 
         if last < 0:
-            last = first - last + 1
+            limit = -last
+        else:
+            limit = last - first
 
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT tid, username, description "
-                "FROM transaction_log "
-                "ORDER BY tid DESC "
-                "LIMIT %s OFFSET %s",
-                (last, first),
-            )
+            if self._pack_tid is not None:
+                cur.execute(
+                    "SELECT tid, username, description, extension "
+                    "FROM transaction_log "
+                    "WHERE tid > %s "
+                    "ORDER BY tid DESC "
+                    "LIMIT %s OFFSET %s",
+                    (self._pack_tid, limit, first),
+                )
+            else:
+                cur.execute(
+                    "SELECT tid, username, description, extension "
+                    "FROM transaction_log "
+                    "ORDER BY tid DESC "
+                    "LIMIT %s OFFSET %s",
+                    (limit, first),
+                )
             rows = cur.fetchall()
 
         result = []
         for row in rows:
+            username = row["username"] or ""
+            description = row["description"] or ""
+            # ZODB expects bytes for user_name/description
+            if isinstance(username, str):
+                username = username.encode("utf-8")
+            if isinstance(description, str):
+                description = description.encode("utf-8")
             d = {
                 "id": p64(row["tid"]),
                 "time": TimeStamp(p64(row["tid"])).timeTime(),
-                "user_name": row["username"] or "",
-                "description": row["description"] or "",
+                "user_name": username,
+                "description": description,
             }
+            # Merge extension metadata into the result dict
+            ext_data = row.get("extension") or b''
+            if ext_data:
+                import json
+                if isinstance(ext_data, memoryview):
+                    ext_data = bytes(ext_data)
+                try:
+                    ext_dict = json.loads(ext_data)
+                    if isinstance(ext_dict, dict):
+                        d.update(ext_dict)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
             if filter is None or filter(d):
                 result.append(d)
         return result
@@ -491,6 +541,8 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
 
         For each object modified in the undone transaction, find its
         previous revision in object_history and re-store that state.
+        If the object was subsequently modified, attempt conflict
+        resolution; raise UndoError if resolution fails.
 
         Returns (tid, [oid_bytes, ...]) for the new undo transaction.
         """
@@ -500,61 +552,25 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         tid_int = u64(transaction_id)
 
         with self._conn.cursor() as cur:
-            # Verify transaction exists
-            cur.execute(
-                "SELECT tid FROM transaction_log WHERE tid = %s",
-                (tid_int,),
-            )
-            if cur.fetchone() is None:
-                raise UndoError("Transaction not found")
+            undo_data = _compute_undo(cur, tid_int, self, self._tmp)
 
-            # Find all objects modified in that transaction
-            cur.execute(
-                "SELECT zoid, class_mod, class_name, state, state_size, refs "
-                "FROM object_history WHERE tid = %s",
-                (tid_int,),
-            )
-            undone_objects = cur.fetchall()
-
-            if not undone_objects:
-                raise UndoError("Transaction has no object changes")
-
-            # For each object, find its previous revision
-            undo_data = []
-            for obj in undone_objects:
-                zoid = obj["zoid"]
-                cur.execute(
-                    "SELECT tid, class_mod, class_name, state, "
-                    "state_size, refs "
-                    "FROM object_history "
-                    "WHERE zoid = %s AND tid < %s "
-                    "ORDER BY tid DESC LIMIT 1",
-                    (zoid, tid_int),
-                )
-                prev = cur.fetchone()
-                if prev is None:
-                    # Object was created in this txn — delete it
-                    undo_data.append({
-                        "zoid": zoid,
-                        "action": "delete",
-                    })
-                else:
-                    undo_data.append({
-                        "zoid": zoid,
-                        "action": "restore",
-                        "class_mod": prev["class_mod"],
-                        "class_name": prev["class_name"],
-                        "state": prev["state"],
-                        "state_size": prev["state_size"],
-                        "refs": prev["refs"],
-                    })
-
-        # Queue the undo data — will be written during _vote
+        # Queue the undo data — will be written during _vote.
+        # Replace any prior pending entry for the same zoid
+        # (happens when multiple undos target the same objects).
         oid_list = []
         for item in undo_data:
             oid_bytes = p64(item["zoid"])
             oid_list.append(oid_bytes)
-            if item["action"] == "restore":
+            # Remove any existing entry for this zoid
+            self._tmp = [
+                e for e in self._tmp if e.get("zoid") != item["zoid"]
+            ]
+            if item["action"] == "delete":
+                self._tmp.append({
+                    "zoid": item["zoid"],
+                    "action": "delete",
+                })
+            else:
                 self._tmp.append({
                     "zoid": item["zoid"],
                     "class_mod": item["class_mod"],
@@ -564,7 +580,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                     "refs": item["refs"],
                 })
 
-        return oid_list
+        return self._tid, oid_list
 
     # ── IStorageIteration ─────────────────────────────────────────────
 
@@ -964,7 +980,10 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             _write_txn_log(cur, tid_int, user, desc, ext)
 
             for obj in self._tmp:
-                _write_object(cur, obj, tid_int, hp)
+                if obj.get("action") == "delete":
+                    _delete_object(cur, obj["zoid"], tid_int, hp)
+                else:
+                    _write_object(cur, obj, tid_int, hp)
 
             for zoid, blob_path in self._blob_tmp:
                 _write_blob(cur, zoid, tid_int, blob_path, hp)
@@ -1116,56 +1135,22 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         tid_int = u64(transaction_id)
 
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT tid FROM transaction_log WHERE tid = %s",
-                (tid_int,),
-            )
-            if cur.fetchone() is None:
-                raise UndoError("Transaction not found")
-
-            cur.execute(
-                "SELECT zoid, class_mod, class_name, state, state_size, refs "
-                "FROM object_history WHERE tid = %s",
-                (tid_int,),
-            )
-            undone_objects = cur.fetchall()
-
-            if not undone_objects:
-                raise UndoError("Transaction has no object changes")
-
-            undo_data = []
-            for obj in undone_objects:
-                zoid = obj["zoid"]
-                cur.execute(
-                    "SELECT tid, class_mod, class_name, state, "
-                    "state_size, refs "
-                    "FROM object_history "
-                    "WHERE zoid = %s AND tid < %s "
-                    "ORDER BY tid DESC LIMIT 1",
-                    (zoid, tid_int),
-                )
-                prev = cur.fetchone()
-                if prev is None:
-                    undo_data.append({
-                        "zoid": zoid,
-                        "action": "delete",
-                    })
-                else:
-                    undo_data.append({
-                        "zoid": zoid,
-                        "action": "restore",
-                        "class_mod": prev["class_mod"],
-                        "class_name": prev["class_name"],
-                        "state": prev["state"],
-                        "state_size": prev["state_size"],
-                        "refs": prev["refs"],
-                    })
+            undo_data = _compute_undo(cur, tid_int, self, self._tmp)
 
         oid_list = []
         for item in undo_data:
             oid_bytes = p64(item["zoid"])
             oid_list.append(oid_bytes)
-            if item["action"] == "restore":
+            # Remove any existing entry for this zoid
+            self._tmp = [
+                e for e in self._tmp if e.get("zoid") != item["zoid"]
+            ]
+            if item["action"] == "delete":
+                self._tmp.append({
+                    "zoid": item["zoid"],
+                    "action": "delete",
+                })
+            else:
                 self._tmp.append({
                     "zoid": item["zoid"],
                     "class_mod": item["class_mod"],
@@ -1175,7 +1160,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
                     "refs": item["refs"],
                 })
 
-        return oid_list
+        return self._tid, oid_list
 
     # ── IStorageRestoreable ───────────────────────────────────────
 
@@ -1235,6 +1220,216 @@ def _write_txn_log(cur, tid_int, user, desc, ext):
         "VALUES (%s, %s, %s, %s)",
         (tid_int, user, desc, _serialize_extension(ext)),
     )
+
+
+def _compute_undo(cur, tid_int, storage, pending=None):
+    """Compute undo data for a transaction.
+
+    For each object modified in the undone transaction:
+    - If the object's current version matches the undone tid, restore
+      the previous revision (or delete if the object was created).
+    - If the object was modified after the undone transaction, attempt
+      conflict resolution. Raises UndoError if resolution fails.
+
+    Args:
+        cur: database cursor
+        tid_int: integer tid of the transaction to undo
+        storage: storage instance (for conflict resolution)
+        pending: list of pending _tmp entries (for multi-undo in same txn)
+
+    Returns:
+        List of dicts with 'action' ('restore' or 'delete') and data.
+    """
+    # Build index of pending writes by zoid for multi-undo
+    pending_by_zoid = {}
+    if pending:
+        for entry in pending:
+            pending_by_zoid[entry["zoid"]] = entry
+    # Verify transaction exists
+    cur.execute(
+        "SELECT tid FROM transaction_log WHERE tid = %s",
+        (tid_int,),
+    )
+    if cur.fetchone() is None:
+        raise UndoError("Transaction not found")
+
+    # Find all objects modified in that transaction
+    cur.execute(
+        "SELECT zoid, class_mod, class_name, state, state_size, refs "
+        "FROM object_history WHERE tid = %s",
+        (tid_int,),
+    )
+    undone_objects = cur.fetchall()
+
+    if not undone_objects:
+        raise UndoError("Transaction has no object changes")
+
+    undo_data = []
+    for obj in undone_objects:
+        zoid = obj["zoid"]
+
+        # Check current version of the object
+        cur.execute(
+            "SELECT tid FROM object_state WHERE zoid = %s",
+            (zoid,),
+        )
+        current = cur.fetchone()
+        current_tid = current["tid"] if current else None
+
+        # Find previous revision (state before the undone transaction)
+        cur.execute(
+            "SELECT tid, class_mod, class_name, state, "
+            "state_size, refs "
+            "FROM object_history "
+            "WHERE zoid = %s AND tid < %s "
+            "ORDER BY tid DESC LIMIT 1",
+            (zoid, tid_int),
+        )
+        prev = cur.fetchone()
+
+        # Check if there's a pending write for this zoid (multi-undo)
+        pending_entry = pending_by_zoid.get(zoid)
+
+        if current_tid is not None and current_tid != tid_int:
+            # Object was modified after the undone transaction —
+            # check if states actually differ before triggering
+            # conflict resolution (cascading undos may change TID
+            # but preserve the same state).
+
+            undone_state = obj["state"]
+            cur_row = None
+
+            if pending_entry is not None:
+                # A prior undo in this same transaction already
+                # queued a write for this zoid. Use that pending
+                # state for comparison instead of the DB state.
+                current_state = pending_entry.get("state")
+                cur_row = pending_entry
+            else:
+                # Get current state from object_state
+                cur.execute(
+                    "SELECT class_mod, class_name, state "
+                    "FROM object_state WHERE zoid = %s",
+                    (zoid,),
+                )
+                cur_row = cur.fetchone()
+                current_state = cur_row["state"] if cur_row else None
+
+            if current_state == undone_state and current is not None:
+                # States match — this is a cascading undo scenario.
+                # The TID changed (from a prior undo) but data is the same.
+                # Treat as simple undo: restore previous revision.
+                if prev is None:
+                    undo_data.append({
+                        "zoid": zoid,
+                        "action": "delete",
+                    })
+                else:
+                    undo_data.append({
+                        "zoid": zoid,
+                        "action": "restore",
+                        "class_mod": prev["class_mod"],
+                        "class_name": prev["class_name"],
+                        "state": prev["state"],
+                        "state_size": prev["state_size"],
+                        "refs": prev["refs"],
+                    })
+            else:
+                # States genuinely differ — requires conflict resolution
+                oid_bytes = p64(zoid)
+
+                # Get the state we want to restore (pre-undo)
+                if prev is None:
+                    # Object was created in undone txn, but modified later
+                    raise UndoError(
+                        f"Can't undo creation of object {zoid:#x}: "
+                        f"modified in later transaction"
+                    )
+
+                # Encode pre-undo state as pickle for conflict resolution
+                pre_undo_record = {
+                    "@cls": [prev["class_mod"], prev["class_name"]],
+                    "@s": _unsanitize_from_pg(prev["state"]),
+                }
+                pre_undo_data = zodb_json_codec.encode_zodb_record(
+                    pre_undo_record
+                )
+
+                # Get current state as pickle
+                current_record = {
+                    "@cls": [cur_row["class_mod"], cur_row["class_name"]],
+                    "@s": _unsanitize_from_pg(cur_row["state"]),
+                }
+                current_data = zodb_json_codec.encode_zodb_record(
+                    current_record
+                )
+
+                # Try conflict resolution
+                try:
+                    resolved = storage.tryToResolveConflict(
+                        oid_bytes,
+                        p64(current_tid),
+                        current_data,
+                        pre_undo_data,
+                    )
+                except ConflictError:
+                    raise UndoError(
+                        f"Can't undo: conflict on object {zoid:#x}"
+                    )
+
+                if resolved is None:
+                    raise UndoError(
+                        f"Can't undo: conflict on object {zoid:#x}"
+                    )
+
+                # Decode resolved pickle back to JSONB
+                resolved_record = zodb_json_codec.decode_zodb_record(
+                    resolved
+                )
+                undo_data.append({
+                    "zoid": zoid,
+                    "action": "restore",
+                    "class_mod": resolved_record["@cls"][0],
+                    "class_name": resolved_record["@cls"][1],
+                    "state": resolved_record["@s"],
+                    "state_size": len(resolved),
+                    "refs": _extract_refs(resolved_record["@s"]),
+                })
+        elif prev is None:
+            # Object was created in this txn — delete it
+            undo_data.append({
+                "zoid": zoid,
+                "action": "delete",
+            })
+        else:
+            # Simple undo: restore previous revision
+            undo_data.append({
+                "zoid": zoid,
+                "action": "restore",
+                "class_mod": prev["class_mod"],
+                "class_name": prev["class_name"],
+                "state": prev["state"],
+                "state_size": prev["state_size"],
+                "refs": prev["refs"],
+            })
+
+    return undo_data
+
+
+def _delete_object(cur, zoid, tid_int, history_preserving=False):
+    """Delete an object (zombie/undo of creation).
+
+    In history-preserving mode, records a tombstone with state=NULL.
+    Removes the object from object_state (current state table).
+    """
+    if history_preserving:
+        cur.execute(
+            "INSERT INTO object_history "
+            "(zoid, tid, class_mod, class_name, state, state_size, refs) "
+            "VALUES (%s, %s, '', '', NULL, 0, '{}')",
+            (zoid, tid_int),
+        )
+    cur.execute("DELETE FROM object_state WHERE zoid = %s", (zoid,))
 
 
 def _write_object(cur, obj, tid_int, history_preserving=False):
@@ -1331,6 +1526,9 @@ def _loadBefore_hp(cur, oid, zoid, tid_int):
     if row is None:
         # No revision before this tid — either doesn't exist or created later
         return None
+    if row["state"] is None:
+        # Tombstone/zombie record (undo of creation) — object doesn't exist
+        raise POSKeyError(oid)
     record = {
         "@cls": [row["class_mod"], row["class_name"]],
         "@s": _unsanitize_from_pg(row["state"]),
@@ -1349,14 +1547,21 @@ def _loadBefore_hp(cur, oid, zoid, tid_int):
 
 
 def _extract_refs(state):
-    """Recursively walk decoded state and collect all @ref OIDs as integers."""
+    """Recursively walk decoded state and collect all @ref OIDs as integers.
+
+    Cross-database references (non-hex OID strings like 'm') are skipped
+    since they reference objects in other databases and are irrelevant for pack.
+    """
     refs = []
     if isinstance(state, dict):
         if "@ref" in state:
             ref_val = state["@ref"]
             # @ref is hex OID string, or [hex_oid, class_path]
             oid_hex = ref_val if isinstance(ref_val, str) else ref_val[0]
-            refs.append(int(oid_hex, 16))
+            try:
+                refs.append(int(oid_hex, 16))
+            except (ValueError, TypeError):
+                pass  # cross-database or non-standard ref — skip
         else:
             for v in state.values():
                 refs.extend(_extract_refs(v))
@@ -1482,11 +1687,15 @@ def _iter_transactions(conn, table, start, stop):
 
             records = []
             for obj_row in obj_rows:
-                record = {
-                    "@cls": [obj_row["class_mod"], obj_row["class_name"]],
-                    "@s": _unsanitize_from_pg(obj_row["state"]),
-                }
-                data = zodb_json_codec.encode_zodb_record(record)
+                if obj_row["state"] is None:
+                    # Zombie/deleted object (undo of creation)
+                    data = None
+                else:
+                    record = {
+                        "@cls": [obj_row["class_mod"], obj_row["class_name"]],
+                        "@s": _unsanitize_from_pg(obj_row["state"]),
+                    }
+                    data = zodb_json_codec.encode_zodb_record(record)
                 records.append(DataRecord(
                     p64(obj_row["zoid"]),
                     tid_bytes,
