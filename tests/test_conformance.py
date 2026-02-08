@@ -41,8 +41,7 @@ from ZODB.tests.TransactionalUndoStorage import TransactionalUndoStorage
 
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-
-DSN = "dbname=zodb_test user=zodb password=zodb host=localhost port=5433"
+from tests.conftest import DSN
 
 
 def _clean_db():

@@ -15,8 +15,7 @@ import zodb_json_codec
 
 from zodb_pgjsonb.schema import install_schema
 
-
-DSN = "dbname=zodb_test user=zodb password=zodb host=localhost port=5433"
+from tests.conftest import DSN
 
 
 @pytest.fixture

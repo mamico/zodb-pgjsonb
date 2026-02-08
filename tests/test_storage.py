@@ -16,8 +16,7 @@ from persistent.mapping import PersistentMapping
 
 from zodb_pgjsonb.storage import PGJsonbStorage
 
-
-DSN = "dbname=zodb_test user=zodb password=zodb host=localhost port=5433"
+from tests.conftest import DSN
 
 
 @pytest.fixture

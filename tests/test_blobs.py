@@ -27,8 +27,7 @@ from persistent.mapping import PersistentMapping
 from zodb_pgjsonb.storage import PGJsonbStorage
 from zodb_pgjsonb.storage import PGJsonbStorageInstance
 
-
-DSN = "dbname=zodb_test user=zodb password=zodb host=localhost port=5433"
+from tests.conftest import DSN
 S3_BUCKET = "test-zodb-blobs"
 S3_REGION = "us-east-1"
 
