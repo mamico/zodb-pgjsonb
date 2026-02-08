@@ -182,9 +182,12 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         self._serial_cache = {}
 
         # Database connection (schema init + admin queries)
+        logger.debug("Connecting to PostgreSQL: %s", dsn)
         self._conn = psycopg.connect(dsn, row_factory=dict_row)
+        logger.debug("Connected to PostgreSQL")
 
         # Connection pool for MVCC instances (autocommit=True, dict_row)
+        logger.debug("Creating connection pool (min=%d, max=%d)", pool_size, pool_max_size)
         self._instance_pool = ConnectionPool(
             dsn,
             min_size=pool_size,
@@ -193,12 +196,16 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             configure=lambda conn: setattr(conn, "autocommit", True),
             open=True,
         )
+        logger.debug("Connection pool ready")
 
         # Initialize schema
+        logger.debug("Installing schema (history_preserving=%s)", history_preserving)
         install_schema(self._conn, history_preserving=history_preserving)
+        logger.debug("Schema installed")
 
         # Load max OID and last TID from database
         self._restore_state()
+        logger.debug("Storage initialized (max_oid=%s, ltid=%s)", self._oid, self._ltid)
 
     def _restore_state(self):
         """Load max OID and last TID from existing data."""

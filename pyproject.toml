@@ -48,6 +48,9 @@ bench = [
     "psycopg2-binary",
 ]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["example/"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/zodb_pgjsonb"]
 
