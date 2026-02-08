@@ -682,3 +682,44 @@ class TestS3BlobsWithZODB:
         with root["doc"].open("r") as f:
             assert f.read() == b"W" * 3000
         conn.close()
+
+
+class TestBlobsHistoryPreserving:
+    """Test blob storage in history-preserving mode (covers blob_history writes)."""
+
+    @pytest.fixture
+    def hp_storage(self):
+        """Fresh HP storage."""
+        _clean_db()
+        s = PGJsonbStorage(DSN, history_preserving=True)
+        yield s
+        s.close()
+
+    @pytest.fixture
+    def hp_db(self, hp_storage):
+        database = ZODB.DB(hp_storage)
+        yield database
+        database.close()
+
+    def test_blob_writes_to_blob_history(self, hp_db):
+        """HP mode writes blobs to both blob_state and blob_history."""
+        from psycopg.rows import dict_row
+
+        import psycopg
+
+        conn = hp_db.open()
+        root = conn.root()
+        root["myblob"] = Blob(b"HP blob data")
+        txn.commit()
+        conn.close()
+
+        pg_conn = psycopg.connect(DSN, row_factory=dict_row)
+        with pg_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM blob_state")
+            state_count = cur.fetchone()["cnt"]
+            cur.execute("SELECT COUNT(*) AS cnt FROM blob_history")
+            history_count = cur.fetchone()["cnt"]
+        pg_conn.close()
+
+        assert state_count >= 1
+        assert history_count >= 1

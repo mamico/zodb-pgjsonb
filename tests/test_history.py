@@ -10,7 +10,11 @@ Requires PostgreSQL on localhost:5433.
 
 from persistent.mapping import PersistentMapping
 from tests.conftest import DSN
+from ZODB.Connection import TransactionMetaData
 from ZODB.interfaces import IStorageUndoable
+from ZODB.POSException import UndoError
+from ZODB.tests.MinPO import MinPO
+from ZODB.tests.StorageTestBase import zodb_pickle
 from ZODB.utils import p64
 from ZODB.utils import u64
 from ZODB.utils import z64
@@ -424,3 +428,130 @@ class TestHistoryPack:
 
         assert orphan_state == 0
         assert orphan_history == 0
+
+
+class TestUndoErrorPaths:
+    """Test undo error conditions."""
+
+    def test_undo_nonexistent_transaction(self, hp_db, hp_storage):
+        """undo() of non-existent transaction raises UndoError."""
+        # Store something first so HP schema is active
+        conn = hp_db.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.commit()
+        conn.close()
+
+        fake_tid = p64(999999999)
+        with pytest.raises(UndoError, match="Transaction not found"):
+            hp_storage.undo(fake_tid)
+
+    def test_undo_hf_raises(self):
+        """Undo on history-free storage raises UndoError."""
+        import psycopg
+
+        conn = psycopg.connect(DSN)
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TABLE IF EXISTS "
+                "pack_state, blob_history, object_history, "
+                "blob_state, object_state, transaction_log CASCADE"
+            )
+        conn.commit()
+        conn.close()
+
+        s = PGJsonbStorage(DSN, history_preserving=False)
+        try:
+            with pytest.raises(UndoError, match="not supported"):
+                s.undo(p64(1))
+        finally:
+            s.close()
+
+    def test_undo_empty_transaction(self, hp_db, hp_storage):
+        """undo() of transaction with no object changes raises UndoError."""
+        # Create a transaction that has a txn_log entry but no objects
+        # (edge case: manually insert a txn_log entry)
+        import psycopg
+
+        pg_conn = psycopg.connect(DSN)
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO transaction_log (tid, username, description) "
+                "VALUES (999999999, '', '')"
+            )
+        pg_conn.commit()
+        pg_conn.close()
+
+        with pytest.raises(UndoError, match="no object changes"):
+            hp_storage.undo(p64(999999999))
+
+    def test_undoLog_hf_returns_empty(self):
+        """undoLog() on history-free storage returns empty list."""
+        import psycopg
+
+        conn = psycopg.connect(DSN)
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TABLE IF EXISTS "
+                "pack_state, blob_history, object_history, "
+                "blob_state, object_state, transaction_log CASCADE"
+            )
+        conn.commit()
+        conn.close()
+
+        s = PGJsonbStorage(DSN, history_preserving=False)
+        try:
+            assert s.undoLog() == []
+        finally:
+            s.close()
+
+    def test_instance_undo_hf_raises(self):
+        """Instance undo on HF storage raises UndoError."""
+        import psycopg
+
+        conn = psycopg.connect(DSN)
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TABLE IF EXISTS "
+                "pack_state, blob_history, object_history, "
+                "blob_state, object_state, transaction_log CASCADE"
+            )
+        conn.commit()
+        conn.close()
+
+        s = PGJsonbStorage(DSN, history_preserving=False)
+        try:
+            inst = s.new_instance()
+            inst.poll_invalidations()
+            with pytest.raises(UndoError, match="not supported"):
+                inst.undo(p64(1))
+            inst.release()
+        finally:
+            s.close()
+
+
+class TestInstanceHistoryDelegates:
+    """Test instance history/pack delegates."""
+
+    def test_instance_history(self, hp_db, hp_storage):
+        """Instance history() delegates to main."""
+        conn = hp_db.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.commit()
+        inst = conn._storage
+        entries = inst.history(z64, size=10)
+        assert len(entries) >= 1
+        conn.close()
+
+    def test_instance_pack(self, hp_db, hp_storage):
+        """Instance pack() delegates to main."""
+        conn = hp_db.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.commit()
+        conn.close()
+
+        inst = hp_storage.new_instance()
+        inst.pack(time.time(), None)  # should not raise
+        inst.release()

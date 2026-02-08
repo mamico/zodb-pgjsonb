@@ -38,7 +38,9 @@ from zodb_pgjsonb.storage import PGJsonbStorage
 import psycopg
 import threading
 import time
+import transaction
 import unittest
+import ZODB
 
 
 def _clean_db():
@@ -169,9 +171,6 @@ class PGJsonbConformanceHF(StorageTestBase, BasicStorage, SynchronizedStorage):
         for _m, tid in results.items():
             self.assertEqual(tid, tids[1])
 
-    def test_checkCurrentSerialInTransaction(self):
-        """Skip: complex multi-threaded test with hardcoded pickle bytes."""
-
     def test_race_load_vs_external_invalidate(self):
         """Skip: requires _new_storage_client which we don't implement."""
 
@@ -211,9 +210,6 @@ class PGJsonbIteratorHF(StorageTestBase, IteratorStorage):
     def testUndoZombie(self):
         """Skip in HF: requires undo support."""
 
-    def testTransactionExtensionFromIterator(self):
-        """Skip: extension_bytes serialization differs from stdlib pickle."""
-
 
 class PGJsonbIteratorHP(StorageTestBase, IteratorStorage, ExtendedIteratorStorage):
     """ZODB conformance — iterator (history-preserving mode).
@@ -225,9 +221,6 @@ class PGJsonbIteratorHP(StorageTestBase, IteratorStorage, ExtendedIteratorStorag
         super().setUp()
         _clean_db()
         self._storage = PGJsonbStorage(DSN, history_preserving=True)
-
-    def testTransactionExtensionFromIterator(self):
-        """Skip: extension_bytes serialization differs from stdlib pickle."""
 
 
 # ── Pack Conformance ─────────────────────────────────────────────────
@@ -248,14 +241,66 @@ class PGJsonbPackHF(StorageTestBase, PackableStorage):
 
     # These tests use pdumps/dumps which are not standard ZODB records.
     # Our codec requires valid ZODB records (two-pickle class+state format).
+    # We provide equivalent replacements using proper ZODB data via DB.
+
     def testPackAllRevisions(self):
-        """Skip: uses pdumps (non-standard pickle format)."""
+        """Pack in HF mode preserves current state (only one revision kept)."""
+        from persistent.mapping import PersistentMapping
+
+        db = ZODB.DB(self._storage)
+        conn = db.open()
+        root = conn.root()
+        root["obj"] = PersistentMapping()
+        root["obj"]["v"] = 1
+        transaction.commit()
+        root["obj"]["v"] = 2
+        transaction.commit()
+        root["obj"]["v"] = 3
+        transaction.commit()
+        db.pack()
+        # Current state survives
+        self.assertEqual(root["obj"]["v"], 3)
+        conn.close()
+        db.close()
 
     def testPackJustOldRevisions(self):
-        """Skip: uses pdumps/dumps (non-standard pickle format)."""
+        """Pack preserves all reachable objects."""
+        from persistent.mapping import PersistentMapping
+
+        db = ZODB.DB(self._storage)
+        conn = db.open()
+        root = conn.root()
+        root["a"] = PersistentMapping()
+        root["b"] = PersistentMapping()
+        root["a"]["v"] = 1
+        root["b"]["v"] = 2
+        transaction.commit()
+        root["a"]["v"] = 3
+        transaction.commit()
+        db.pack()
+        self.assertEqual(root["a"]["v"], 3)
+        self.assertEqual(root["b"]["v"], 2)
+        conn.close()
+        db.close()
 
     def testPackOnlyOneObject(self):
-        """Skip: uses pdumps/dumps (non-standard pickle format)."""
+        """Pack removes unreachable objects."""
+        from persistent.mapping import PersistentMapping
+
+        db = ZODB.DB(self._storage)
+        conn = db.open()
+        root = conn.root()
+        root["keep"] = PersistentMapping()
+        root["remove"] = PersistentMapping()
+        transaction.commit()
+        # Remove reference to make object unreachable
+        del root["remove"]
+        transaction.commit()
+        db.pack()
+        self.assertIn("keep", root)
+        self.assertNotIn("remove", root)
+        conn.close()
+        db.close()
 
 
 class PGJsonbPackHP(StorageTestBase, PackableUndoStorage):
@@ -269,8 +314,26 @@ class PGJsonbPackHP(StorageTestBase, PackableUndoStorage):
         _clean_db()
         self._storage = PGJsonbStorage(DSN, history_preserving=True)
 
-    def testRedundantPack(self):
-        """Skip: uses C() class that produces empty module name on reload."""
+    def _initroot(self):
+        """Override: create root using proper ZODB pickle format.
+
+        The standard _initroot() uses Pickler(class_object, None) which
+        produces a GLOBAL-in-TUPLE2 format our codec can't decode.
+        We use zodb_pickle to create a proper two-pickle record.
+        """
+        from persistent.mapping import PersistentMapping
+
+        try:
+            utils.load_current(self._storage, ZERO)
+        except KeyError:
+            t = TransactionMetaData()
+            t.description = "initial database creation"
+            self._storage.tpc_begin(t)
+            self._storage.store(
+                ZERO, None, zodb_pickle(PersistentMapping()), "", t
+            )
+            self._storage.tpc_vote(t)
+            self._storage.tpc_finish(t)
 
 
 # ── Undo Conformance ─────────────────────────────────────────────────
@@ -301,31 +364,51 @@ class PGJsonbUndoHP(StorageTestBase, TransactionalUndoStorage):
 # ── Recovery Conformance ─────────────────────────────────────────────
 
 
-@unittest.skip(
-    "Recovery tests require a second database; "
-    "both source and dst share the same tables via same DSN"
-)
 class PGJsonbRecoveryHP(StorageTestBase, RecoveryStorage):
     """ZODB conformance — recovery (history-preserving mode).
 
     RecoveryStorage tests copyTransactionsFrom, restore, and pack on
-    a destination storage.  Requires self._storage (source) and
-    self._dst (destination) to use DIFFERENT databases.
-
-    Currently skipped: both storages share the same DSN so
-    copyTransactionsFrom would try to insert duplicate data.
+    a destination storage.  Uses a separate database (zodb_test_dst)
+    for the destination storage.
     """
+
+    _DST_DB = "zodb_test_dst"
 
     def setUp(self):
         super().setUp()
+        # Create destination database
+        admin_conn = psycopg.connect(DSN)
+        admin_conn.autocommit = True
+        admin_conn.execute(
+            "SELECT pg_terminate_backend(pid) "
+            "FROM pg_stat_activity "
+            "WHERE datname = %s AND pid != pg_backend_pid()",
+            (self._DST_DB,),
+        )
+        admin_conn.execute(f"DROP DATABASE IF EXISTS {self._DST_DB}")
+        admin_conn.execute(f"CREATE DATABASE {self._DST_DB}")
+        admin_conn.close()
+
         _clean_db()
         self._storage = PGJsonbStorage(DSN, history_preserving=True)
-        self._dst = PGJsonbStorage(DSN, history_preserving=True)
+        dst_dsn = DSN.replace("dbname=zodb_test", f"dbname={self._DST_DB}")
+        self._dst = PGJsonbStorage(dst_dsn, history_preserving=True)
 
     def tearDown(self):
         if hasattr(self, "_dst"):
             self._dst.close()
         super().tearDown()
+        # Drop destination database
+        admin_conn = psycopg.connect(DSN)
+        admin_conn.autocommit = True
+        admin_conn.execute(
+            "SELECT pg_terminate_backend(pid) "
+            "FROM pg_stat_activity "
+            "WHERE datname = %s AND pid != pg_backend_pid()",
+            (self._DST_DB,),
+        )
+        admin_conn.execute(f"DROP DATABASE IF EXISTS {self._DST_DB}")
+        admin_conn.close()
 
 
 if __name__ == "__main__":

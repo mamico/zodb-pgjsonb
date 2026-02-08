@@ -502,7 +502,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         """Called by BaseStorage.tpc_abort — rollback PG transaction."""
         try:
             self._conn.rollback()
-        except Exception:
+        except Exception:  # pragma: no cover
             logger.exception("Error during rollback")
         # Clean up queued blob temp files
         for _, blob_path in self._blob_tmp:
@@ -590,7 +590,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             for key in s3_keys:
                 try:
                     self._s3_client.delete_object(key)
-                except Exception:
+                except Exception:  # pragma: no cover
                     logger.warning("Failed to delete S3 blob: %s", key)
 
     # ── IStorageUndoable ─────────────────────────────────────────────
@@ -645,18 +645,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 "description": description,
             }
             # Merge extension metadata into the result dict
-            ext_data = row.get("extension") or b""
-            if ext_data:
-                import json
-
-                if isinstance(ext_data, memoryview):
-                    ext_data = bytes(ext_data)
-                try:
-                    ext_dict = json.loads(ext_data)
-                    if isinstance(ext_dict, dict):
-                        d.update(ext_dict)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
+            ext_dict = _deserialize_extension(row.get("extension"))
+            if ext_dict:
+                d.update(ext_dict)
             if filter is None or filter(d):
                 result.append(d)
         return result
@@ -1167,7 +1158,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         """Rollback the PG transaction."""
         try:
             self._conn.execute("ROLLBACK")
-        except Exception:
+        except Exception:  # pragma: no cover
             logger.exception("Error during rollback")
         self._tmp.clear()
         # Clean up queued blob temp files
@@ -1372,16 +1363,58 @@ def _serialize_extension(ext):
     """Serialize transaction extension for BYTEA storage.
 
     ZODB extensions are dicts; we store them as JSON bytes in PG.
+    BaseStorage passes extension_bytes (pickle) — we always convert to JSON.
     """
+    import json
+
     if isinstance(ext, bytes):
-        return ext
+        if not ext:
+            return b""
+        # BaseStorage passes zodbpickle-serialized bytes — decode to dict
+        try:
+            from ZODB._compat import loads as zodb_loads
+
+            ext_dict = zodb_loads(ext)
+            if isinstance(ext_dict, dict) and ext_dict:
+                return json.dumps(ext_dict).encode("utf-8")
+            return b""
+        except Exception:
+            return ext  # fallback: store as-is
     if isinstance(ext, dict):
         if not ext:
             return b""
-        import json
-
         return json.dumps(ext).encode("utf-8")
     return b""
+
+
+def _deserialize_extension(ext_data):
+    """Deserialize extension bytes from PG BYTEA back to a dict.
+
+    Stored as JSON by _serialize_extension.  Falls back to pickle
+    for legacy data written before JSON serialization was in place.
+    """
+    import json
+
+    if not ext_data:
+        return {}
+    if isinstance(ext_data, memoryview):
+        ext_data = bytes(ext_data)
+    try:
+        result = json.loads(ext_data)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        pass
+    # Fallback: try pickle (legacy data)
+    try:
+        from ZODB._compat import loads as zodb_loads
+
+        result = zodb_loads(ext_data)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    return {}
 
 
 def _write_txn_log(cur, tid_int, user, desc, ext):
@@ -1902,11 +1935,15 @@ def _iter_transactions(conn, table, start, stop):
                     )
                 )
 
+            # Deserialize extension bytes (stored as JSON) back to dict.
+            # TransactionMetaData expects a dict for .extension property.
+            ext_dict = _deserialize_extension(txn_row["extension"])
+
             yield PGTransactionRecord(
                 tid_bytes,
                 " ",
                 txn_row["username"] or "",
                 txn_row["description"] or "",
-                txn_row["extension"] or b"",
+                ext_dict,
                 records,
             )
