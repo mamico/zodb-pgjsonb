@@ -36,8 +36,10 @@ difference affects the performance profile:
 
 Single stores are faster because PGJsonbStorage has a simpler 2PC path (direct
 SQL, no OID/TID tracking tables). Batch stores are slower because each object
-requires JSONB transcoding. Both storages serve hot reads from their local LRU
-cache — PGJsonbStorage's cache is slightly faster due to simpler lookup logic.
+requires a separate INSERT — transcoding is <1% of batch time (0.16 ms for 100
+objects via `decode_zodb_record_for_pg`), the bottleneck is 100 serial SQL
+statements. Both storages serve hot reads from their local LRU cache —
+PGJsonbStorage's cache is slightly faster due to simpler lookup logic.
 
 ## ZODB.DB (through object cache)
 
@@ -96,11 +98,7 @@ queryability of all ZODB data via JSONB**.
 - All ZODB data queryable via SQL/JSONB (unique to PGJsonbStorage)
 
 **Trade-offs:**
-- Batch stores slower (per-object JSONB transcoding overhead)
-
-**Future optimizations:**
-- Prepared statements for load/store queries
-- Batch transcoding in Rust (amortize PyO3 overhead)
+- Batch stores slower (per-object SQL INSERTs, not transcoding — see above)
 
 ## Running Benchmarks
 

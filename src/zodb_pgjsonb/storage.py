@@ -356,10 +356,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                             oid=oid, serials=(committed_tid, serial)
                         )
 
-        record = zodb_json_codec.decode_zodb_record(data)
-        class_mod, class_name = record["@cls"]
-        state = record["@s"]
-        refs = _extract_refs(state)
+        class_mod, class_name, state, refs = (
+            zodb_json_codec.decode_zodb_record_for_pg(data)
+        )
 
         self._tmp.append({
             "zoid": zoid,
@@ -702,10 +701,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             raise StorageTransactionError(self, transaction)
         if data is None:
             return  # undo of object creation
-        record = zodb_json_codec.decode_zodb_record(data)
-        class_mod, class_name = record["@cls"]
-        state = record["@s"]
-        refs = _extract_refs(state)
+        class_mod, class_name, state, refs = (
+            zodb_json_codec.decode_zodb_record_for_pg(data)
+        )
         self._tmp.append({
             "zoid": u64(oid),
             "class_mod": class_mod,
@@ -1028,10 +1026,9 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
                             oid=oid, serials=(committed_tid, serial)
                         )
 
-        record = zodb_json_codec.decode_zodb_record(data)
-        class_mod, class_name = record["@cls"]
-        state = record["@s"]
-        refs = _extract_refs(state)
+        class_mod, class_name, state, refs = (
+            zodb_json_codec.decode_zodb_record_for_pg(data)
+        )
 
         self._tmp.append({
             "zoid": zoid,
@@ -1273,10 +1270,9 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             raise StorageTransactionError(self, transaction)
         if data is None:
             return
-        record = zodb_json_codec.decode_zodb_record(data)
-        class_mod, class_name = record["@cls"]
-        state = record["@s"]
-        refs = _extract_refs(state)
+        class_mod, class_name, state, refs = (
+            zodb_json_codec.decode_zodb_record_for_pg(data)
+        )
         self._tmp.append({
             "zoid": u64(oid),
             "class_mod": class_mod,
@@ -1486,17 +1482,17 @@ def _compute_undo(cur, tid_int, storage, pending=None):
                     )
 
                 # Decode resolved pickle back to JSONB
-                resolved_record = zodb_json_codec.decode_zodb_record(
-                    resolved
+                r_mod, r_name, r_state, r_refs = (
+                    zodb_json_codec.decode_zodb_record_for_pg(resolved)
                 )
                 undo_data.append({
                     "zoid": zoid,
                     "action": "restore",
-                    "class_mod": resolved_record["@cls"][0],
-                    "class_name": resolved_record["@cls"][1],
-                    "state": resolved_record["@s"],
+                    "class_mod": r_mod,
+                    "class_name": r_name,
+                    "state": r_state,
                     "state_size": len(resolved),
-                    "refs": _extract_refs(resolved_record["@s"]),
+                    "refs": r_refs,
                 })
         elif prev is None:
             # Object was created in this txn — delete it
@@ -1542,7 +1538,7 @@ def _write_object(cur, obj, tid_int, history_preserving=False):
         "tid": tid_int,
         "class_mod": obj["class_mod"],
         "class_name": obj["class_name"],
-        "state": Json(_sanitize_for_pg(obj["state"])),
+        "state": Json(obj["state"]),
         "state_size": obj["state_size"],
         "refs": obj["refs"],
     }
