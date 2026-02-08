@@ -274,7 +274,7 @@ def _bench_store_single(storage, iterations, warmup):
         storage.tpc_vote(t)
         storage.tpc_finish(t)
 
-    return bench_one(do_store, iterations=iterations, warmup=0)
+    return bench_one(do_store, iterations=iterations, warmup=warmup)
 
 
 def _bench_store_batch(storage, batch_size, iterations, warmup):
@@ -297,11 +297,16 @@ def _bench_store_batch(storage, batch_size, iterations, warmup):
         storage.tpc_vote(t)
         storage.tpc_finish(t)
 
-    return bench_one(do_store_batch, iterations=iterations, warmup=0)
+    return bench_one(do_store_batch, iterations=iterations, warmup=warmup)
 
 
-def _bench_load_single(storage, iterations, warmup):
-    """Benchmark: single load (object must exist)."""
+def _bench_load_cached(storage, iterations, warmup):
+    """Benchmark: load from in-memory LRU cache (same OID, cache hit after warmup).
+
+    After warmup iterations, the single OID is in the cache.
+    All measured iterations are cache hits — this measures cache implementation
+    speed (pure-Python OrderedDict for PGJsonb vs Cython for RelStorage).
+    """
     from ZODB.Connection import TransactionMetaData
     from ZODB.utils import z64
 
@@ -320,8 +325,12 @@ def _bench_load_single(storage, iterations, warmup):
     return bench_one(do_load, iterations=iterations, warmup=warmup)
 
 
-def _bench_load_batch(storage, batch_size, iterations, warmup):
-    """Benchmark: N sequential load() calls."""
+def _bench_load_batch_cached(storage, batch_size, iterations, warmup):
+    """Benchmark: N sequential load() calls from cache (cache hits after warmup).
+
+    All N objects fit in the LRU cache after warmup. Measured iterations
+    are all cache hits — shows cache throughput for N sequential lookups.
+    """
     from ZODB.Connection import TransactionMetaData
     from ZODB.utils import z64
 
@@ -344,6 +353,43 @@ def _bench_load_batch(storage, batch_size, iterations, warmup):
     return bench_one(do_load_batch, iterations=iterations, warmup=warmup)
 
 
+def _bench_load_uncached(storage, iterations, warmup):
+    """Benchmark: cold load from DB (guaranteed cache miss each iteration).
+
+    Stores warmup+iterations unique objects, then loads each exactly once.
+    Every measured load is a first-access cache miss, forcing a DB round-trip.
+    For PGJsonbStorage this includes JSONB-to-pickle transcoding via the
+    Rust codec. For RelStorage this is a raw bytea fetch.
+    """
+    from ZODB.Connection import TransactionMetaData
+    from ZODB.utils import z64
+
+    total = warmup + iterations
+    data = zodb_pickle(MinPO(42))
+
+    # Store all objects in batches of 100
+    oids = []
+    batch = 100
+    for start in range(0, total, batch):
+        end = min(start + batch, total)
+        t = TransactionMetaData()
+        storage.tpc_begin(t)
+        for _ in range(end - start):
+            oid = storage.new_oid()
+            oids.append(oid)
+            storage.store(oid, z64, data, "", t)
+        storage.tpc_vote(t)
+        storage.tpc_finish(t)
+
+    idx = [0]
+
+    def do_load():
+        storage.load(oids[idx[0]])
+        idx[0] += 1
+
+    return bench_one(do_load, iterations=iterations, warmup=warmup)
+
+
 def run_storage_benchmarks(iterations, warmup):
     """Run storage-level benchmarks for all backends."""
     results = {}
@@ -355,11 +401,14 @@ def run_storage_benchmarks(iterations, warmup):
             "store batch 100",
             lambda s: _bench_store_batch(s, 100, max(iterations // 5, 10), warmup),
         ),
-        ("load single", lambda s: _bench_load_single(s, iterations, warmup)),
+        ("load cached", lambda s: _bench_load_cached(s, iterations, warmup)),
         (
-            "load batch 100",
-            lambda s: _bench_load_batch(s, 100, max(iterations // 5, 10), warmup),
+            "load batch cached",
+            lambda s: _bench_load_batch_cached(
+                s, 100, max(iterations // 5, 10), warmup
+            ),
         ),
+        ("load uncached", lambda s: _bench_load_uncached(s, iterations, warmup)),
     ]
 
     for bench_name, bench_fn in benchmarks:
@@ -447,7 +496,12 @@ def _bench_zodb_write_btree(db, iterations, warmup):
 
 
 def _bench_zodb_read(db, iterations, warmup):
-    """Benchmark: read existing object from root."""
+    """Benchmark: read from ZODB connection object cache.
+
+    After first access, ZODB's connection pool retains the object cache,
+    so subsequent reads are Python dict lookups (~2-3us for both backends).
+    This measures ZODB object cache overhead, not storage performance.
+    """
     import transaction
 
     conn = db.open()
@@ -533,7 +587,7 @@ def run_zodb_benchmarks(iterations, warmup):
             "zodb write btree",
             lambda db: _bench_zodb_write_btree(db, iterations, warmup),
         ),
-        ("zodb read", lambda db: _bench_zodb_read(db, iterations, warmup)),
+        ("zodb cached read", lambda db: _bench_zodb_read(db, iterations, warmup)),
         (
             "zodb connection cycle",
             lambda db: _bench_zodb_connection_cycle(db, iterations, warmup),
@@ -582,67 +636,71 @@ def run_zodb_benchmarks(iterations, warmup):
 # ---------------------------------------------------------------------------
 
 
-def _bench_pack(make_fn, n_objects):
+def _bench_pack(make_fn, n_objects, pack_iterations=3):
     """Benchmark pack for a single backend at a given size.
 
-    Populates the storage via ZODB.DB, then packs through the DB
-    (which keeps the storage open).
+    Runs pack_iterations times (fresh DB each), returns TimingStats.
+    Each iteration: clean DB → populate → time pack → close.
     """
     from persistent.mapping import PersistentMapping
 
     import transaction
     import ZODB
 
-    storage = make_fn()
-    if storage is None:
-        return None
+    stats = TimingStats()
+    reachable = n_objects // 2
+    garbage = n_objects - reachable
 
-    db = None
-    try:
-        db = ZODB.DB(storage)
-        conn = db.open()
-        root = conn.root()
+    for _ in range(pack_iterations):
+        storage = make_fn()
+        if storage is None:
+            return None, 0, 0
 
-        # Create reachable objects
-        reachable = n_objects // 2
-        for i in range(reachable):
-            root[f"obj_{i}"] = PersistentMapping({"value": i})
-        transaction.commit()
+        db = None
+        try:
+            db = ZODB.DB(storage)
+            conn = db.open()
+            root = conn.root()
 
-        # Create garbage objects (store directly, not referenced from root)
-        from ZODB.Connection import TransactionMetaData
-        from ZODB.utils import z64
+            # Create reachable objects
+            for i in range(reachable):
+                root[f"obj_{i}"] = PersistentMapping({"value": i})
+            transaction.commit()
 
-        data = zodb_pickle(MinPO(999))
-        garbage = n_objects - reachable
-        t = TransactionMetaData()
-        storage.tpc_begin(t)
-        for _ in range(garbage):
-            oid = storage.new_oid()
-            storage.store(oid, z64, data, "", t)
-        storage.tpc_vote(t)
-        storage.tpc_finish(t)
+            # Create garbage objects (store directly, not referenced from root)
+            from ZODB.Connection import TransactionMetaData
+            from ZODB.utils import z64
 
-        conn.close()
+            data = zodb_pickle(MinPO(999))
+            t = TransactionMetaData()
+            storage.tpc_begin(t)
+            for _ in range(garbage):
+                oid = storage.new_oid()
+                storage.store(oid, z64, data, "", t)
+            storage.tpc_vote(t)
+            storage.tpc_finish(t)
 
-        # Measure pack
-        t0 = time.perf_counter()
-        db.pack(time.time())
-        t1 = time.perf_counter()
-        elapsed_ms = (t1 - t0) * 1000.0
-        return elapsed_ms, reachable, garbage
-    except Exception as exc:
-        print(f" ERROR: {exc}")
-        return None
-    finally:
-        if db is not None:
-            db.close()
-        else:
-            storage.close()
+            conn.close()
+
+            # Measure pack
+            t0 = time.perf_counter()
+            db.pack(time.time())
+            t1 = time.perf_counter()
+            stats.samples.append((t1 - t0) * 1000.0)
+        except Exception as exc:
+            print(f" ERROR: {exc}")
+            return None, 0, 0
+        finally:
+            if db is not None:
+                db.close()
+            else:
+                storage.close()
+
+    return stats, reachable, garbage
 
 
 def run_pack_benchmarks():
-    """Run pack benchmarks at various sizes."""
+    """Run pack benchmarks at various sizes (3 iterations each)."""
     results = {}
 
     for n_objects in [100, 1000, 10000]:
@@ -656,12 +714,12 @@ def run_pack_benchmarks():
                 end="",
                 flush=True,
             )
-            result = _bench_pack(make_fn, n_objects)
-            if result is not None:
-                elapsed_ms, reachable, garbage = result
-                results[n_objects][backend_name] = elapsed_ms
+            stats, reachable, garbage = _bench_pack(make_fn, n_objects)
+            if stats is not None and stats.count > 0:
+                results[n_objects][backend_name] = stats
                 print(
-                    f" {_fmt_ms(elapsed_ms)} ({reachable} reachable, {garbage} garbage)"
+                    f" {_fmt_ms(stats.mean)} +/- {_fmt_ms(stats.stddev)}"
+                    f" ({reachable} reachable, {garbage} garbage, n={stats.count})"
                 )
             else:
                 print(" skipped")
@@ -929,36 +987,44 @@ def print_zodb_results(results: dict, iterations: int, warmup: int):
 
 def print_pack_results(results: dict):
     print(f"\n{HEADER}{'=' * 78}")
-    print(" Pack / GC")
+    print(" Pack / GC (3 iterations each)")
     print(f"{'=' * 78}{RESET}\n")
 
     has_relstorage = any("RelStorage" in v for v in results.values())
 
     if has_relstorage:
         print(
-            f"  {'Objects':<12} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}"
+            f"  {'Objects':<12} {'PGJsonb':>20} {'RelStorage':>20} {'Comparison':>20}"
         )
-        print(f"  {'-' * 58}")
+        print(f"  {'-' * 74}")
     else:
-        print(f"  {'Objects':<12} {'PGJsonb':>12}")
-        print(f"  {'-' * 26}")
+        print(f"  {'Objects':<12} {'PGJsonb':>20}")
+        print(f"  {'-' * 34}")
 
     for n_objects, backend_results in results.items():
-        pj_ms = backend_results.get("PGJsonbStorage")
-        rs_ms = backend_results.get("RelStorage")
+        pj_stats = backend_results.get("PGJsonbStorage")
+        rs_stats = backend_results.get("RelStorage")
 
-        pj_str = _fmt_ms(pj_ms) if pj_ms is not None else "N/A"
+        pj_str = (
+            f"{_fmt_ms(pj_stats.mean)} +/- {_fmt_ms(pj_stats.stddev)}"
+            if pj_stats is not None
+            else "N/A"
+        )
 
         if has_relstorage:
-            rs_str = _fmt_ms(rs_ms) if rs_ms is not None else "N/A"
+            rs_str = (
+                f"{_fmt_ms(rs_stats.mean)} +/- {_fmt_ms(rs_stats.stddev)}"
+                if rs_stats is not None
+                else "N/A"
+            )
             cmp_str = (
-                _comparison(pj_ms, rs_ms)
-                if pj_ms is not None and rs_ms is not None
+                _comparison(pj_stats.mean, rs_stats.mean)
+                if pj_stats is not None and rs_stats is not None
                 else ""
             )
-            print(f"  {n_objects:<12} {pj_str:>12} {rs_str:>12} {cmp_str:>20}")
+            print(f"  {n_objects:<12} {pj_str:>20} {rs_str:>20} {cmp_str:>20}")
         else:
-            print(f"  {n_objects:<12} {pj_str:>12}")
+            print(f"  {n_objects:<12} {pj_str:>20}")
 
     print()
 
@@ -1032,6 +1098,22 @@ def results_to_json(
         "python_version": sys.version,
         "iterations": iterations,
         "warmup": warmup,
+        "config": {
+            "pgjsonb": {
+                "cache_type": "OrderedDict LRU (pure Python)",
+                "cache_default_mb": 64,
+                "cache_scope": "per-instance (not shared)",
+                "transcode": "zodb-json-codec (Rust/PyO3)",
+                "storage_format": "JSONB",
+            },
+            "relstorage": {
+                "cache_type": "generational LRU (Cython)",
+                "cache_default_mb": 10,
+                "cache_scope": "shared across instances",
+                "transcode": "none (raw pickle bytes)",
+                "storage_format": "bytea",
+            },
+        },
     }
 
     try:
@@ -1066,7 +1148,7 @@ def results_to_json(
         out["pack"] = {}
         for n_objects, backend_results in pack_results.items():
             out["pack"][str(n_objects)] = {
-                name: {"time_ms": round(ms, 3)} for name, ms in backend_results.items()
+                name: stats.to_dict() for name, stats in backend_results.items()
             }
 
     if plone_results:

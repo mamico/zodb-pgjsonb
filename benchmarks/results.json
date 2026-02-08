@@ -1,118 +1,156 @@
 {
-  "timestamp": "2026-02-08T01:24:45.732516+00:00",
+  "timestamp": "2026-02-08T23:31:07.781598+00:00",
   "python_version": "3.13.9 (main, Oct 14 2025, 21:29:44) [Clang 20.1.4 ]",
   "iterations": 100,
   "warmup": 10,
+  "config": {
+    "pgjsonb": {
+      "cache_type": "OrderedDict LRU (pure Python)",
+      "cache_default_mb": 64,
+      "cache_scope": "per-instance (not shared)",
+      "transcode": "zodb-json-codec (Rust/PyO3)",
+      "storage_format": "JSONB"
+    },
+    "relstorage": {
+      "cache_type": "generational LRU (Cython)",
+      "cache_default_mb": 10,
+      "cache_scope": "shared across instances",
+      "transcode": "none (raw pickle bytes)",
+      "storage_format": "bytea"
+    }
+  },
   "pgjsonb_version": "dev",
   "relstorage_version": "unknown",
   "storage": {
     "store single": {
       "PGJsonbStorage": {
         "count": 100,
-        "mean_ms": 5.343,
-        "median_ms": 5.249,
-        "p95_ms": 6.282,
-        "p99_ms": 6.75,
-        "min_ms": 4.378,
-        "max_ms": 7.0,
-        "stddev_ms": 0.542
+        "mean_ms": 3.6,
+        "median_ms": 3.561,
+        "p95_ms": 3.997,
+        "p99_ms": 4.335,
+        "min_ms": 3.204,
+        "max_ms": 4.473,
+        "stddev_ms": 0.242
       },
       "RelStorage": {
         "count": 100,
-        "mean_ms": 8.144,
-        "median_ms": 7.79,
-        "p95_ms": 11.169,
-        "p99_ms": 11.793,
-        "min_ms": 5.443,
-        "max_ms": 14.302,
-        "stddev_ms": 1.843
+        "mean_ms": 4.828,
+        "median_ms": 4.766,
+        "p95_ms": 5.295,
+        "p99_ms": 5.809,
+        "min_ms": 4.302,
+        "max_ms": 8.075,
+        "stddev_ms": 0.432
       }
     },
     "store batch 10": {
       "PGJsonbStorage": {
         "count": 100,
-        "mean_ms": 9.113,
-        "median_ms": 9.356,
-        "p95_ms": 10.85,
-        "p99_ms": 11.941,
-        "min_ms": 4.896,
-        "max_ms": 13.368,
-        "stddev_ms": 1.377
+        "mean_ms": 4.82,
+        "median_ms": 4.501,
+        "p95_ms": 6.537,
+        "p99_ms": 10.004,
+        "min_ms": 3.743,
+        "max_ms": 11.124,
+        "stddev_ms": 1.119
       },
       "RelStorage": {
         "count": 100,
-        "mean_ms": 9.438,
-        "median_ms": 9.108,
-        "p95_ms": 11.424,
-        "p99_ms": 12.119,
-        "min_ms": 6.676,
-        "max_ms": 14.653,
-        "stddev_ms": 1.446
+        "mean_ms": 10.384,
+        "median_ms": 9.806,
+        "p95_ms": 17.827,
+        "p99_ms": 24.342,
+        "min_ms": 4.748,
+        "max_ms": 37.759,
+        "stddev_ms": 5.237
       }
     },
     "store batch 100": {
       "PGJsonbStorage": {
         "count": 20,
-        "mean_ms": 18.364,
-        "median_ms": 17.153,
-        "p95_ms": 24.311,
-        "p99_ms": 26.651,
-        "min_ms": 15.792,
-        "max_ms": 27.236,
-        "stddev_ms": 3.015
+        "mean_ms": 7.809,
+        "median_ms": 7.822,
+        "p95_ms": 8.327,
+        "p99_ms": 8.987,
+        "min_ms": 7.079,
+        "max_ms": 9.151,
+        "stddev_ms": 0.504
       },
       "RelStorage": {
         "count": 20,
-        "mean_ms": 9.464,
-        "median_ms": 8.834,
-        "p95_ms": 13.051,
-        "p99_ms": 13.315,
-        "min_ms": 6.754,
-        "max_ms": 13.382,
-        "stddev_ms": 2.108
+        "mean_ms": 6.528,
+        "median_ms": 6.462,
+        "p95_ms": 7.032,
+        "p99_ms": 7.036,
+        "min_ms": 6.168,
+        "max_ms": 7.037,
+        "stddev_ms": 0.285
       }
     },
-    "load single": {
+    "load cached": {
       "PGJsonbStorage": {
         "count": 100,
-        "mean_ms": 0.158,
-        "median_ms": 0.155,
-        "p95_ms": 0.275,
-        "p99_ms": 0.312,
-        "min_ms": 0.082,
-        "max_ms": 0.33,
-        "stddev_ms": 0.063
+        "mean_ms": 0.0,
+        "median_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.001,
+        "min_ms": 0.0,
+        "max_ms": 0.001,
+        "stddev_ms": 0.0
       },
       "RelStorage": {
         "count": 100,
-        "mean_ms": 0.002,
-        "median_ms": 0.002,
-        "p95_ms": 0.003,
-        "p99_ms": 0.004,
-        "min_ms": 0.002,
-        "max_ms": 0.006,
+        "mean_ms": 0.001,
+        "median_ms": 0.001,
+        "p95_ms": 0.001,
+        "p99_ms": 0.002,
+        "min_ms": 0.001,
+        "max_ms": 0.002,
         "stddev_ms": 0.0
       }
     },
-    "load batch 100": {
+    "load batch cached": {
       "PGJsonbStorage": {
         "count": 20,
-        "mean_ms": 8.55,
-        "median_ms": 8.151,
-        "p95_ms": 10.517,
-        "p99_ms": 11.236,
-        "min_ms": 7.32,
-        "max_ms": 11.415,
-        "stddev_ms": 1.007
+        "mean_ms": 0.024,
+        "median_ms": 0.024,
+        "p95_ms": 0.025,
+        "p99_ms": 0.025,
+        "min_ms": 0.023,
+        "max_ms": 0.025,
+        "stddev_ms": 0.0
       },
       "RelStorage": {
         "count": 20,
-        "mean_ms": 0.098,
-        "median_ms": 0.098,
-        "p95_ms": 0.101,
-        "p99_ms": 0.104,
-        "min_ms": 0.093,
-        "max_ms": 0.105,
+        "mean_ms": 0.105,
+        "median_ms": 0.103,
+        "p95_ms": 0.11,
+        "p99_ms": 0.111,
+        "min_ms": 0.1,
+        "max_ms": 0.111,
+        "stddev_ms": 0.004
+      }
+    },
+    "load uncached": {
+      "PGJsonbStorage": {
+        "count": 100,
+        "mean_ms": 0.097,
+        "median_ms": 0.091,
+        "p95_ms": 0.117,
+        "p99_ms": 0.254,
+        "min_ms": 0.077,
+        "max_ms": 0.269,
+        "stddev_ms": 0.028
+      },
+      "RelStorage": {
+        "count": 100,
+        "mean_ms": 0.045,
+        "median_ms": 0.044,
+        "p95_ms": 0.052,
+        "p99_ms": 0.054,
+        "min_ms": 0.041,
+        "max_ms": 0.059,
         "stddev_ms": 0.003
       }
     }
@@ -121,64 +159,64 @@
     "zodb write simple": {
       "PGJsonbStorage": {
         "count": 100,
-        "mean_ms": 7.476,
-        "median_ms": 8.015,
-        "p95_ms": 10.791,
-        "p99_ms": 12.444,
-        "min_ms": 4.478,
-        "max_ms": 12.858,
-        "stddev_ms": 2.382
+        "mean_ms": 5.384,
+        "median_ms": 5.252,
+        "p95_ms": 6.358,
+        "p99_ms": 8.673,
+        "min_ms": 4.416,
+        "max_ms": 10.189,
+        "stddev_ms": 0.817
       },
       "RelStorage": {
         "count": 100,
-        "mean_ms": 8.263,
-        "median_ms": 7.917,
-        "p95_ms": 11.034,
-        "p99_ms": 12.183,
-        "min_ms": 5.834,
-        "max_ms": 12.262,
-        "stddev_ms": 1.631
+        "mean_ms": 5.721,
+        "median_ms": 5.644,
+        "p95_ms": 6.437,
+        "p99_ms": 6.571,
+        "min_ms": 5.154,
+        "max_ms": 7.163,
+        "stddev_ms": 0.369
       }
     },
     "zodb write btree": {
       "PGJsonbStorage": {
         "count": 100,
-        "mean_ms": 6.258,
-        "median_ms": 6.359,
-        "p95_ms": 8.079,
-        "p99_ms": 10.305,
-        "min_ms": 4.052,
-        "max_ms": 10.504,
-        "stddev_ms": 1.228
+        "mean_ms": 4.451,
+        "median_ms": 4.424,
+        "p95_ms": 5.058,
+        "p99_ms": 5.333,
+        "min_ms": 3.76,
+        "max_ms": 5.375,
+        "stddev_ms": 0.31
       },
       "RelStorage": {
         "count": 100,
-        "mean_ms": 8.33,
-        "median_ms": 8.137,
-        "p95_ms": 11.195,
-        "p99_ms": 12.022,
-        "min_ms": 5.893,
-        "max_ms": 12.366,
-        "stddev_ms": 1.672
+        "mean_ms": 5.517,
+        "median_ms": 5.511,
+        "p95_ms": 6.06,
+        "p99_ms": 6.198,
+        "min_ms": 4.946,
+        "max_ms": 6.222,
+        "stddev_ms": 0.278
       }
     },
-    "zodb read": {
+    "zodb cached read": {
       "PGJsonbStorage": {
         "count": 100,
-        "mean_ms": 0.003,
+        "mean_ms": 0.002,
         "median_ms": 0.002,
-        "p95_ms": 0.004,
-        "p99_ms": 0.004,
+        "p95_ms": 0.002,
+        "p99_ms": 0.003,
         "min_ms": 0.001,
-        "max_ms": 0.009,
-        "stddev_ms": 0.001
+        "max_ms": 0.005,
+        "stddev_ms": 0.0
       },
       "RelStorage": {
         "count": 100,
         "mean_ms": 0.002,
         "median_ms": 0.002,
         "p95_ms": 0.003,
-        "p99_ms": 0.003,
+        "p99_ms": 0.004,
         "min_ms": 0.001,
         "max_ms": 0.005,
         "stddev_ms": 0.001
@@ -187,129 +225,171 @@
     "zodb connection cycle": {
       "PGJsonbStorage": {
         "count": 100,
-        "mean_ms": 0.397,
-        "median_ms": 0.3,
-        "p95_ms": 0.814,
-        "p99_ms": 1.016,
-        "min_ms": 0.219,
-        "max_ms": 1.02,
-        "stddev_ms": 0.204
+        "mean_ms": 0.171,
+        "median_ms": 0.156,
+        "p95_ms": 0.234,
+        "p99_ms": 0.376,
+        "min_ms": 0.134,
+        "max_ms": 0.445,
+        "stddev_ms": 0.05
       },
       "RelStorage": {
         "count": 100,
-        "mean_ms": 0.269,
-        "median_ms": 0.257,
-        "p95_ms": 0.368,
-        "p99_ms": 0.616,
-        "min_ms": 0.154,
-        "max_ms": 0.646,
-        "stddev_ms": 0.086
+        "mean_ms": 0.148,
+        "median_ms": 0.144,
+        "p95_ms": 0.179,
+        "p99_ms": 0.296,
+        "min_ms": 0.118,
+        "max_ms": 0.369,
+        "stddev_ms": 0.03
       }
     },
     "zodb write batch 10": {
       "PGJsonbStorage": {
         "count": 20,
-        "mean_ms": 10.677,
-        "median_ms": 9.741,
-        "p95_ms": 14.224,
-        "p99_ms": 14.435,
-        "min_ms": 7.618,
-        "max_ms": 14.488,
-        "stddev_ms": 2.171
+        "mean_ms": 7.69,
+        "median_ms": 7.724,
+        "p95_ms": 8.671,
+        "p99_ms": 8.746,
+        "min_ms": 6.297,
+        "max_ms": 8.765,
+        "stddev_ms": 0.785
       },
       "RelStorage": {
         "count": 20,
-        "mean_ms": 10.779,
-        "median_ms": 11.209,
-        "p95_ms": 12.191,
-        "p99_ms": 12.675,
-        "min_ms": 8.58,
-        "max_ms": 12.796,
-        "stddev_ms": 1.287
+        "mean_ms": 6.716,
+        "median_ms": 6.682,
+        "p95_ms": 7.374,
+        "p99_ms": 7.475,
+        "min_ms": 6.157,
+        "max_ms": 7.5,
+        "stddev_ms": 0.405
       }
     }
   },
   "pack": {
     "100": {
       "PGJsonbStorage": {
-        "time_ms": 7.595
+        "count": 3,
+        "mean_ms": 5.681,
+        "median_ms": 5.683,
+        "p95_ms": 5.713,
+        "p99_ms": 5.716,
+        "min_ms": 5.644,
+        "max_ms": 5.717,
+        "stddev_ms": 0.036
       },
       "RelStorage": {
-        "time_ms": 179.812
+        "count": 3,
+        "mean_ms": 125.385,
+        "median_ms": 124.897,
+        "p95_ms": 129.167,
+        "p99_ms": 129.547,
+        "min_ms": 121.617,
+        "max_ms": 129.642,
+        "stddev_ms": 4.034
       }
     },
     "1000": {
       "PGJsonbStorage": {
-        "time_ms": 7.628
+        "count": 3,
+        "mean_ms": 6.944,
+        "median_ms": 6.965,
+        "p95_ms": 7.122,
+        "p99_ms": 7.136,
+        "min_ms": 6.728,
+        "max_ms": 7.139,
+        "stddev_ms": 0.206
       },
       "RelStorage": {
-        "time_ms": 191.096
+        "count": 3,
+        "mean_ms": 163.141,
+        "median_ms": 164.223,
+        "p95_ms": 164.696,
+        "p99_ms": 164.738,
+        "min_ms": 160.454,
+        "max_ms": 164.748,
+        "stddev_ms": 2.342
       }
     },
     "10000": {
       "PGJsonbStorage": {
-        "time_ms": 18.22
+        "count": 3,
+        "mean_ms": 26.645,
+        "median_ms": 22.433,
+        "p95_ms": 33.806,
+        "p99_ms": 34.817,
+        "min_ms": 22.43,
+        "max_ms": 35.07,
+        "stddev_ms": 7.297
       },
       "RelStorage": {
-        "time_ms": 612.854
+        "count": 3,
+        "mean_ms": 484.768,
+        "median_ms": 486.947,
+        "p95_ms": 498.441,
+        "p99_ms": 499.463,
+        "min_ms": 467.639,
+        "max_ms": 499.719,
+        "stddev_ms": 16.15
       }
     }
   },
   "plone": {
     "PGJsonbStorage": {
       "backend": "PGJsonbStorage",
-      "site_creation_ms": 1178.922,
+      "site_creation_ms": 1085.072,
       "content_creation": {
         "count": 50,
-        "mean_ms": 30.086,
-        "median_ms": 29.754,
-        "min_ms": 26.995,
-        "max_ms": 48.527,
-        "total_ms": 1504.282
+        "mean_ms": 28.236,
+        "median_ms": 27.567,
+        "min_ms": 23.509,
+        "max_ms": 44.212,
+        "total_ms": 1411.795
       },
       "catalog_query": {
         "count": 50,
-        "mean_ms": 0.201,
-        "median_ms": 0.18,
-        "min_ms": 0.165,
-        "max_ms": 0.885,
-        "total_ms": 10.063
+        "mean_ms": 0.199,
+        "median_ms": 0.191,
+        "min_ms": 0.164,
+        "max_ms": 0.359,
+        "total_ms": 9.959
       },
       "content_modification": {
         "count": 50,
-        "mean_ms": 7.393,
-        "median_ms": 7.3,
-        "min_ms": 6.234,
-        "max_ms": 8.733,
-        "total_ms": 369.667
+        "mean_ms": 6.811,
+        "median_ms": 6.554,
+        "min_ms": 5.859,
+        "max_ms": 10.881,
+        "total_ms": 340.571
       }
     },
     "RelStorage": {
       "backend": "RelStorage",
-      "site_creation_ms": 1056.127,
+      "site_creation_ms": 1058.731,
       "content_creation": {
         "count": 50,
-        "mean_ms": 27.032,
-        "median_ms": 26.564,
-        "min_ms": 23.678,
-        "max_ms": 45.331,
-        "total_ms": 1351.583
+        "mean_ms": 27.236,
+        "median_ms": 26.895,
+        "min_ms": 23.379,
+        "max_ms": 46.031,
+        "total_ms": 1361.792
       },
       "catalog_query": {
         "count": 50,
-        "mean_ms": 0.19,
-        "median_ms": 0.185,
-        "min_ms": 0.165,
-        "max_ms": 0.334,
-        "total_ms": 9.52
+        "mean_ms": 0.18,
+        "median_ms": 0.17,
+        "min_ms": 0.161,
+        "max_ms": 0.364,
+        "total_ms": 9.006
       },
       "content_modification": {
         "count": 50,
-        "mean_ms": 6.596,
-        "median_ms": 6.357,
-        "min_ms": 5.951,
-        "max_ms": 8.095,
-        "total_ms": 329.807
+        "mean_ms": 6.688,
+        "median_ms": 6.374,
+        "min_ms": 5.916,
+        "max_ms": 9.024,
+        "total_ms": 334.384
       }
     }
   }
