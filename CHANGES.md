@@ -21,3 +21,9 @@
   Extra columns are included in the pipelined `executemany()` batch write
   during `tpc_vote()`, keeping everything in the same PostgreSQL
   transaction for full atomicity.
+
+- **State processor DDL via `get_schema_sql()`**: Processors can now
+  optionally provide a `get_schema_sql()` method returning DDL statements
+  (e.g. `ALTER TABLE`, `CREATE INDEX`). The DDL is applied using the
+  storage's own connection during `register_state_processor()`, avoiding
+  REPEATABLE READ lock conflicts with pool connections.
