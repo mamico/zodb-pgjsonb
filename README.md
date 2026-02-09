@@ -96,6 +96,7 @@ ZODB.DB
 - **Configurable history modes** (history-free or history-preserving with undo)
 - **Connection pooling** via psycopg3 ConnectionPool
 - **Pipelined batch writes** via `executemany()` (single network round-trip)
+- **State processor plugins** for writing extra columns atomically alongside object state
 - **zodbconvert compatible** for migration from RelStorage or FileStorage
 - **ZConfig integration** for standard Zope/Plone deployment
 

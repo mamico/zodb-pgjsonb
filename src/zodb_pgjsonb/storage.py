@@ -35,6 +35,7 @@ from ZODB.utils import u64
 from ZODB.utils import z64
 
 import base64
+import dataclasses
 import logging
 import os
 import psycopg
@@ -47,6 +48,24 @@ import zope.interface
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class ExtraColumn:
+    """Declares an extra column for object_state written by a state processor.
+
+    Attributes:
+        name: PostgreSQL column name.
+        value_expr: SQL value expression for INSERT, e.g. ``"%(name)s"`` or
+            ``"to_tsvector('simple'::regconfig, %(name)s)"``.
+        update_expr: Optional ON CONFLICT update expression.  Defaults to
+            ``"EXCLUDED.{name}"`` when *None*.
+    """
+
+    name: str
+    value_expr: str
+    update_expr: str | None = None
+
 
 # Default cache size: 16 MB per instance (tunable via cache_local_mb parameter)
 DEFAULT_CACHE_LOCAL_MB = 16
@@ -173,6 +192,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         self._blob_cache = blob_cache  # S3BlobCache for local caching
         self._blob_threshold = blob_threshold  # bytes; blobs >= this go to S3
 
+        # State processors (plugins that extract extra column data during writes)
+        self._state_processors = []
+
         # Pending stores for current transaction (direct use only)
         self._tmp = []
         self._blob_tmp = []  # pending blob stores: [(oid_int, blob_path), ...]
@@ -236,6 +258,38 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 # Ensure _ts is at least as recent as the last committed TID
                 # so _new_tid() generates monotonically increasing TIDs.
                 self._ts = TimeStamp(self._ltid)
+
+    # ── State Processors ───────────────────────────────────────────
+
+    def register_state_processor(self, processor):
+        """Register a processor that extracts extra column data from state.
+
+        The *processor* must implement:
+
+        - ``get_extra_columns() -> list[ExtraColumn]``
+        - ``process(zoid, class_mod, class_name, state) -> dict | None``
+
+        ``process`` may modify *state* in-place (e.g. pop annotation keys).
+        It returns a dict of ``{column_name: value}`` to be written as extra
+        columns alongside the object, or *None* when no extra data applies.
+        """
+        self._state_processors.append(processor)
+
+    def _process_state(self, zoid, class_mod, class_name, state):
+        """Run all registered state processors, return merged extra data."""
+        extra = {}
+        for proc in self._state_processors:
+            result = proc.process(zoid, class_mod, class_name, state)
+            if result:
+                extra.update(result)
+        return extra or None
+
+    def _get_extra_columns(self):
+        """Collect extra column definitions from all state processors."""
+        columns = []
+        for proc in self._state_processors:
+            columns.extend(proc.get_extra_columns())
+        return columns or None
 
     # ── IMVCCStorage ─────────────────────────────────────────────────
 
@@ -381,16 +435,18 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             data
         )
 
-        self._tmp.append(
-            {
-                "zoid": zoid,
-                "class_mod": class_mod,
-                "class_name": class_name,
-                "state": state,
-                "state_size": len(data),
-                "refs": refs,
-            }
-        )
+        entry = {
+            "zoid": zoid,
+            "class_mod": class_mod,
+            "class_name": class_name,
+            "state": state,
+            "state_size": len(data),
+            "refs": refs,
+        }
+        extra = self._process_state(zoid, class_mod, class_name, state)
+        if extra:
+            entry["_extra"] = extra
+        self._tmp.append(entry)
 
     def checkCurrentSerialInTransaction(self, oid, serial, transaction):
         """Verify that the object's serial hasn't changed during this txn."""
@@ -446,7 +502,8 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 else:
                     writes.append(obj)
 
-            _batch_write_objects(cur, writes, tid_int, hp)
+            extra_columns = self._get_extra_columns()
+            _batch_write_objects(cur, writes, tid_int, hp, extra_columns=extra_columns)
             _batch_delete_objects(cur, deletes, tid_int, hp)
             _batch_write_blobs(
                 cur,
@@ -731,19 +788,22 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             raise StorageTransactionError(self, transaction)
         if data is None:
             return  # undo of object creation
+        zoid = u64(oid)
         class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
             data
         )
-        self._tmp.append(
-            {
-                "zoid": u64(oid),
-                "class_mod": class_mod,
-                "class_name": class_name,
-                "state": state,
-                "state_size": len(data),
-                "refs": refs,
-            }
-        )
+        entry = {
+            "zoid": zoid,
+            "class_mod": class_mod,
+            "class_name": class_name,
+            "state": state,
+            "state_size": len(data),
+            "refs": refs,
+        }
+        extra = self._process_state(zoid, class_mod, class_name, state)
+        if extra:
+            entry["_extra"] = extra
+        self._tmp.append(entry)
 
     def restoreBlob(self, oid, serial, data, blobfilename, prev_txn, transaction):
         """Restore object data + blob without conflict checking."""
@@ -1069,16 +1129,18 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             data
         )
 
-        self._tmp.append(
-            {
-                "zoid": zoid,
-                "class_mod": class_mod,
-                "class_name": class_name,
-                "state": state,
-                "state_size": len(data),
-                "refs": refs,
-            }
-        )
+        entry = {
+            "zoid": zoid,
+            "class_mod": class_mod,
+            "class_name": class_name,
+            "state": state,
+            "state_size": len(data),
+            "refs": refs,
+        }
+        extra = self._main._process_state(zoid, class_mod, class_name, state)
+        if extra:
+            entry["_extra"] = extra
+        self._tmp.append(entry)
 
     # ── 2PC ──────────────────────────────────────────────────────────
 
@@ -1129,7 +1191,8 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
                 else:
                     writes.append(obj)
 
-            _batch_write_objects(cur, writes, tid_int, hp)
+            extra_columns = self._main._get_extra_columns()
+            _batch_write_objects(cur, writes, tid_int, hp, extra_columns=extra_columns)
             _batch_delete_objects(cur, deletes, tid_int, hp)
             _batch_write_blobs(
                 cur,
@@ -1332,19 +1395,22 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             raise StorageTransactionError(self, transaction)
         if data is None:
             return
+        zoid = u64(oid)
         class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
             data
         )
-        self._tmp.append(
-            {
-                "zoid": u64(oid),
-                "class_mod": class_mod,
-                "class_name": class_name,
-                "state": state,
-                "state_size": len(data),
-                "refs": refs,
-            }
-        )
+        entry = {
+            "zoid": zoid,
+            "class_mod": class_mod,
+            "class_name": class_name,
+            "state": state,
+            "state_size": len(data),
+            "refs": refs,
+        }
+        extra = self._main._process_state(zoid, class_mod, class_name, state)
+        if extra:
+            entry["_extra"] = extra
+        self._tmp.append(entry)
 
     def restoreBlob(self, oid, serial, data, blobfilename, prev_txn, transaction):
         """Restore object data + blob without conflict checking."""
@@ -1625,17 +1691,46 @@ def _compute_undo(cur, tid_int, storage, pending=None):
     return undo_data
 
 
-def _batch_write_objects(cur, objects, tid_int, history_preserving=False):
+def _batch_write_objects(
+    cur, objects, tid_int, history_preserving=False, extra_columns=None
+):
     """Write multiple objects in batch using executemany (pipelined).
 
     psycopg3's executemany() automatically uses pipeline mode, sending
     all statements in a single network round-trip instead of waiting for
     each individual result.
+
+    When *extra_columns* is provided (a list of :class:`ExtraColumn`),
+    additional columns are included in the ``object_state`` INSERT.
+    History tables always use the base columns only.
     """
     if not objects:
         return
-    params_list = [
-        {
+
+    # ── Base columns (always present) ────────────────────────────
+    base_cols = [
+        "zoid",
+        "tid",
+        "class_mod",
+        "class_name",
+        "state",
+        "state_size",
+        "refs",
+    ]
+    base_vals = [
+        "%(zoid)s",
+        "%(tid)s",
+        "%(class_mod)s",
+        "%(class_name)s",
+        "%(state)s",
+        "%(state_size)s",
+        "%(refs)s",
+    ]
+
+    # ── Build params list ────────────────────────────────────────
+    params_list = []
+    for obj in objects:
+        params = {
             "zoid": obj["zoid"],
             "tid": tid_int,
             "class_mod": obj["class_mod"],
@@ -1644,8 +1739,13 @@ def _batch_write_objects(cur, objects, tid_int, history_preserving=False):
             "state_size": obj["state_size"],
             "refs": obj["refs"],
         }
-        for obj in objects
-    ]
+        if extra_columns:
+            obj_extra = obj.get("_extra") or {}
+            for ec in extra_columns:
+                params[ec.name] = obj_extra.get(ec.name)
+        params_list.append(params)
+
+    # ── History table (base columns only) ────────────────────────
     if history_preserving:
         cur.executemany(
             "INSERT INTO object_history "
@@ -1654,15 +1754,27 @@ def _batch_write_objects(cur, objects, tid_int, history_preserving=False):
             "%(state)s, %(state_size)s, %(refs)s)",
             params_list,
         )
+
+    # ── object_state INSERT with extra columns ───────────────────
+    if extra_columns:
+        cols = base_cols + [ec.name for ec in extra_columns]
+        vals = base_vals + [ec.value_expr for ec in extra_columns]
+        update_parts = []
+        for c in cols[1:]:  # skip zoid (PK)
+            update_parts.append(f"{c} = EXCLUDED.{c}")
+    else:
+        cols = base_cols
+        vals = base_vals
+        update_parts = [f"{c} = EXCLUDED.{c}" for c in cols[1:]]
+
+    cols_str = ", ".join(cols)
+    vals_str = ", ".join(vals)
+    update_str = ", ".join(update_parts)
+
     cur.executemany(
-        "INSERT INTO object_state "
-        "(zoid, tid, class_mod, class_name, state, state_size, refs) "
-        "VALUES (%(zoid)s, %(tid)s, %(class_mod)s, %(class_name)s, "
-        "%(state)s, %(state_size)s, %(refs)s) "
-        "ON CONFLICT (zoid) DO UPDATE SET "
-        "tid = EXCLUDED.tid, class_mod = EXCLUDED.class_mod, "
-        "class_name = EXCLUDED.class_name, state = EXCLUDED.state, "
-        "state_size = EXCLUDED.state_size, refs = EXCLUDED.refs",
+        f"INSERT INTO object_state ({cols_str}) "
+        f"VALUES ({vals_str}) "
+        f"ON CONFLICT (zoid) DO UPDATE SET {update_str}",
         params_list,
     )
 
