@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1 (unreleased)
+
+- nothing yet
+
 ## 1.0.0
 
 ### Added
