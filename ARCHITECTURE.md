@@ -75,7 +75,6 @@ CREATE TABLE blob_state (
 );
 
 CREATE INDEX idx_object_class ON object_state (class_mod, class_name);
-CREATE INDEX idx_object_state_gin ON object_state USING gin (state jsonb_path_ops);
 CREATE INDEX idx_object_refs ON object_state USING gin (refs);
 ```
 

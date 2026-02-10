@@ -36,8 +36,6 @@ CREATE TABLE IF NOT EXISTS blob_state (
 -- Indexes for queryability
 CREATE INDEX IF NOT EXISTS idx_object_class
     ON object_state (class_mod, class_name);
-CREATE INDEX IF NOT EXISTS idx_object_state_gin
-    ON object_state USING gin (state jsonb_path_ops);
 CREATE INDEX IF NOT EXISTS idx_object_refs
     ON object_state USING gin (refs);
 
