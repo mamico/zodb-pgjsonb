@@ -194,6 +194,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
 
         # State processors (plugins that extract extra column data during writes)
         self._state_processors = []
+        self._pending_ddl = []  # Deferred DDL: [(sql, name), ...]
 
         # Pending stores for current transaction (direct use only)
         self._tmp = []
@@ -239,6 +240,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
 
         # Load max OID and last TID from database
         self._restore_state()
+        # Commit implicit transaction so self._conn is clean for later DDL
+        # (register_state_processor needs ACCESS EXCLUSIVE for ALTER TABLE)
+        self._conn.commit()
         logger.debug("Storage initialized (max_oid=%s, ltid=%s)", self._oid, self._ltid)
 
     def _restore_state(self):
@@ -273,7 +277,8 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
 
         - ``get_schema_sql() -> str | None``
           Return DDL to apply (e.g. ALTER TABLE, CREATE INDEX).  Applied
-          once via the storage's own connection (no REPEATABLE READ locks).
+          via a separate autocommit connection.  If blocked by startup
+          read transactions, deferred to the first tpc_begin().
 
         ``process`` may modify *state* in-place (e.g. pop annotation keys).
         It returns a dict of ``{column_name: value}`` to be written as extra
@@ -282,17 +287,55 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         self._state_processors.append(processor)
         # Apply processor schema DDL if available
         if hasattr(processor, "get_schema_sql"):
+            sql = processor.get_schema_sql()
+            if sql:
+                self._apply_processor_ddl(sql, type(processor).__name__)
+
+    def _apply_processor_ddl(self, sql, processor_name):
+        """Apply DDL from a state processor, handling lock conflicts.
+
+        ALTER TABLE needs ACCESS EXCLUSIVE which conflicts with
+        ACCESS SHARE held by REPEATABLE READ pool connections.
+
+        During Zope startup, a ZODB Connection loads objects via
+        REPEATABLE READ, holding ACCESS SHARE on object_state.
+        The IDatabaseOpenedWithRoot subscriber fires while that
+        read transaction is still open — so DDL would deadlock.
+
+        Strategy: try with a short lock_timeout.  If blocked,
+        defer the DDL.  It will be applied in tpc_begin() after
+        the read transaction is committed.
+        """
+        try:
+            with psycopg.connect(self._dsn, autocommit=True) as ddl_conn:
+                ddl_conn.execute("SET lock_timeout = '2s'")
+                ddl_conn.execute(sql)
+            logger.info("Applied schema DDL from %s", processor_name)
+        except Exception:
+            logger.info(
+                "DDL from %s deferred (lock conflict at startup). "
+                "Will apply on first write transaction.",
+                processor_name,
+            )
+            self._pending_ddl.append((sql, processor_name))
+
+    def _apply_pending_ddl(self):
+        """Apply any deferred DDL.  Called from tpc_begin() after
+        the read transaction is committed (ACCESS SHARE released).
+        """
+        if not self._pending_ddl:
+            return
+        pending = self._pending_ddl[:]
+        self._pending_ddl.clear()
+        for sql, name in pending:
             try:
-                sql = processor.get_schema_sql()
-                if sql:
-                    self._conn.execute(sql)
-                    self._conn.commit()
-                    logger.info("Applied schema DDL from %s", type(processor).__name__)
+                with psycopg.connect(self._dsn, autocommit=True) as ddl_conn:
+                    ddl_conn.execute(sql)
+                logger.info("Applied deferred schema DDL from %s", name)
             except Exception:
-                self._conn.rollback()
                 logger.warning(
-                    "Failed to apply schema DDL from %s",
-                    type(processor).__name__,
+                    "Failed to apply deferred DDL from %s",
+                    name,
                     exc_info=True,
                 )
 
@@ -419,7 +462,11 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
     # ── IStorage: store ──────────────────────────────────────────────
 
     def store(self, oid, serial, data, version, transaction):
-        """Queue an object for storage during the current transaction."""
+        """Queue an object for storage during the current transaction.
+
+        Conflict detection is deferred to _vote() where all conflicts are
+        checked in a single batch query, eliminating per-object round trips.
+        """
         if transaction is not self._transaction:
             raise StorageTransactionError(self, transaction)
 
@@ -427,30 +474,6 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             raise TypeError("versions are not supported")
 
         zoid = u64(oid)
-
-        if serial != z64:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT tid FROM object_state WHERE zoid = %s",
-                    (zoid,),
-                )
-                row = cur.fetchone()
-            if row is not None:
-                committed_tid = p64(row["tid"])
-                if committed_tid != serial:
-                    committed_data = self.loadSerial(oid, committed_tid)
-                    resolved = self.tryToResolveConflict(
-                        oid,
-                        committed_tid,
-                        serial,
-                        data,
-                        committedData=committed_data,
-                    )
-                    if resolved:
-                        data = resolved
-                        self._resolved.append(oid)
-                    else:
-                        raise ConflictError(oid=oid, serials=(committed_tid, serial))
 
         class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
             data
@@ -464,26 +487,21 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             "state_size": len(data),
             "refs": refs,
         }
+        # Save conflict detection data for batch check in _vote()
+        if serial != z64:
+            entry["_oid"] = oid
+            entry["_serial"] = serial
+            entry["_data"] = data
         extra = self._process_state(zoid, class_mod, class_name, state)
         if extra:
             entry["_extra"] = extra
         self._tmp.append(entry)
 
     def checkCurrentSerialInTransaction(self, oid, serial, transaction):
-        """Verify that the object's serial hasn't changed during this txn."""
+        """Queue a read-conflict check for batch verification in _vote()."""
         if transaction is not self._transaction:
             raise StorageTransactionError(self, transaction)
-        zoid = u64(oid)
-        with self._conn.cursor() as cur:
-            cur.execute("SELECT tid FROM object_state WHERE zoid = %s", (zoid,))
-            row = cur.fetchone()
-        if row is not None:
-            current_serial = p64(row["tid"])
-            if current_serial != serial:
-                raise ReadConflictError(
-                    oid=oid,
-                    serials=(current_serial, serial),
-                )
+        self._read_conflicts.append((oid, serial))
 
     # ── BaseStorage hooks (2PC) ──────────────────────────────────────
 
@@ -491,6 +509,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         """Called by BaseStorage.tpc_begin after acquiring commit lock."""
         self._ude = (u, d, e)
         self._voted = False
+        self._read_conflicts = []
         self._conn.execute("BEGIN")
         self._conn.execute("SELECT pg_advisory_xact_lock(0)")
 
@@ -500,6 +519,9 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         Called by BaseStorage.tpc_vote, and also from tpc_finish to handle
         cases where tpc_vote is skipped (e.g. undo → tpc_finish).
         Idempotent: only flushes once per transaction.
+
+        Performs batch conflict detection for all queued stores in a single
+        round trip, then writes all objects in batched executemany calls.
         """
         if self._voted:
             return None
@@ -509,6 +531,10 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         hp = self._history_preserving
 
         with self._conn.cursor() as cur:
+            # ── Batch conflict detection ──────────────────────────
+            _batch_resolve_conflicts(cur, self._tmp, self._resolved, self)
+            _batch_check_read_conflicts(cur, self._read_conflicts)
+
             u, d, e = self._ude
             user = u.decode("utf-8") if isinstance(u, bytes) else u
             desc = d.decode("utf-8") if isinstance(d, bytes) else d
@@ -1112,7 +1138,12 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         return self._main.new_oid()
 
     def store(self, oid, serial, data, version, transaction):
-        """Queue an object for storage during the current transaction."""
+        """Queue an object for storage during the current transaction.
+
+        Conflict detection is deferred to tpc_vote() where all conflicts
+        are checked in a single batch query, eliminating per-object
+        round trips while holding the advisory lock.
+        """
         if transaction is not self._transaction:
             raise StorageTransactionError(self, transaction)
 
@@ -1120,31 +1151,6 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             raise TypeError("versions are not supported")
 
         zoid = u64(oid)
-
-        # Conflict detection: serial must match committed TID
-        if serial != z64:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT tid FROM object_state WHERE zoid = %s",
-                    (zoid,),
-                )
-                row = cur.fetchone()
-            if row is not None:
-                committed_tid = p64(row["tid"])
-                if committed_tid != serial:
-                    committed_data = self.loadSerial(oid, committed_tid)
-                    resolved = self.tryToResolveConflict(
-                        oid,
-                        committed_tid,
-                        serial,
-                        data,
-                        committedData=committed_data,
-                    )
-                    if resolved:
-                        data = resolved
-                        self._resolved.append(oid)
-                    else:
-                        raise ConflictError(oid=oid, serials=(committed_tid, serial))
 
         class_mod, class_name, state, refs = zodb_json_codec.decode_zodb_record_for_pg(
             data
@@ -1158,6 +1164,11 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             "state_size": len(data),
             "refs": refs,
         }
+        # Save conflict detection data for batch check in tpc_vote()
+        if serial != z64:
+            entry["_oid"] = oid
+            entry["_serial"] = serial
+            entry["_data"] = data
         extra = self._main._process_state(zoid, class_mod, class_name, state)
         if extra:
             entry["_extra"] = extra
@@ -1172,10 +1183,14 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         acquires the advisory lock, and generates a TID.
         """
         self._end_read_txn()
+        # Apply any DDL deferred from startup (read txn now committed,
+        # ACCESS SHARE released, so ALTER TABLE can proceed).
+        self._main._apply_pending_ddl()
         self._transaction = transaction
         self._resolved = []
         self._tmp = []
         self._blob_tmp = []
+        self._read_conflicts = []
         self._conn.execute("BEGIN")
         self._conn.execute("SELECT pg_advisory_xact_lock(0)")
         if tid is None:
@@ -1184,7 +1199,11 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
             self._tid = tid
 
     def tpc_vote(self, transaction):
-        """Flush pending stores + blobs to PostgreSQL."""
+        """Flush pending stores + blobs to PostgreSQL.
+
+        Performs batch conflict detection for all queued stores in a single
+        round trip, then writes all objects in batched executemany calls.
+        """
         if transaction is not self._transaction:
             if transaction is not None:
                 raise StorageTransactionError(self, transaction)
@@ -1194,6 +1213,10 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         hp = self._history_preserving
 
         with self._conn.cursor() as cur:
+            # ── Batch conflict detection ──────────────────────────
+            _batch_resolve_conflicts(cur, self._tmp, self._resolved, self)
+            _batch_check_read_conflicts(cur, self._read_conflicts)
+
             user = transaction.user
             desc = transaction.description
             ext = transaction.extension
@@ -1253,20 +1276,10 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         self._transaction = None
 
     def checkCurrentSerialInTransaction(self, oid, serial, transaction):
-        """Verify that the object's serial hasn't changed."""
+        """Queue a read-conflict check for batch verification in tpc_vote()."""
         if transaction is not self._transaction:
             raise StorageTransactionError(self, transaction)
-        zoid = u64(oid)
-        with self._conn.cursor() as cur:
-            cur.execute("SELECT tid FROM object_state WHERE zoid = %s", (zoid,))
-            row = cur.fetchone()
-        if row is not None:
-            current_serial = p64(row["tid"])
-            if current_serial != serial:
-                raise ReadConflictError(
-                    oid=oid,
-                    serials=(current_serial, serial),
-                )
+        self._read_conflicts.append((oid, serial))
 
     # ── IBlobStorage ─────────────────────────────────────────────────
 
@@ -1710,6 +1723,97 @@ def _compute_undo(cur, tid_int, storage, pending=None):
             )
 
     return undo_data
+
+
+# ── Batch conflict detection ─────────────────────────────────────────
+
+
+def _batch_resolve_conflicts(cur, tmp, resolved, storage):
+    """Check all queued stores for write conflicts in a single round trip.
+
+    Entries with ``_serial`` are checked: if the committed TID differs from
+    the expected serial, conflict resolution is attempted.  Resolved entries
+    are updated in-place with re-decoded state.
+    """
+    conflict_entries = [e for e in tmp if "_serial" in e]
+    if not conflict_entries:
+        return
+
+    check_zoids = [e["zoid"] for e in conflict_entries]
+    cur.execute(
+        "SELECT zoid, tid FROM object_state WHERE zoid = ANY(%s)",
+        (check_zoids,),
+        prepare=True,
+    )
+    committed = {row["zoid"]: row["tid"] for row in cur.fetchall()}
+
+    for entry in conflict_entries:
+        zoid = entry["zoid"]
+        if zoid not in committed:
+            continue  # New object, no conflict possible
+        committed_tid = p64(committed[zoid])
+        if committed_tid == entry["_serial"]:
+            continue  # Serial matches, no conflict
+
+        # Conflict detected — attempt resolution
+        oid = entry["_oid"]
+        committed_data = storage.loadSerial(oid, committed_tid)
+        result = storage.tryToResolveConflict(
+            oid,
+            committed_tid,
+            entry["_serial"],
+            entry["_data"],
+            committedData=committed_data,
+        )
+        if result:
+            # Re-decode resolved pickle and update entry in-place
+            class_mod, class_name, state, refs = (
+                zodb_json_codec.decode_zodb_record_for_pg(result)
+            )
+            entry["class_mod"] = class_mod
+            entry["class_name"] = class_name
+            entry["state"] = state
+            entry["state_size"] = len(result)
+            entry["refs"] = refs
+            # Re-process state for catalog/extra columns
+            if hasattr(storage, "_main"):
+                extra = storage._main._process_state(zoid, class_mod, class_name, state)
+            else:
+                extra = storage._process_state(zoid, class_mod, class_name, state)
+            if extra:
+                entry["_extra"] = extra
+            resolved.append(oid)
+        else:
+            raise ConflictError(oid=oid, serials=(committed_tid, entry["_serial"]))
+
+    # Clean up conflict detection data from entries
+    for entry in conflict_entries:
+        entry.pop("_oid", None)
+        entry.pop("_serial", None)
+        entry.pop("_data", None)
+
+
+def _batch_check_read_conflicts(cur, read_conflicts):
+    """Check all queued read-conflict checks in a single round trip."""
+    if not read_conflicts:
+        return
+
+    zoids = [u64(oid) for oid, _ in read_conflicts]
+    serial_map = {u64(oid): serial for oid, serial in read_conflicts}
+    cur.execute(
+        "SELECT zoid, tid FROM object_state WHERE zoid = ANY(%s)",
+        (zoids,),
+        prepare=True,
+    )
+    for row in cur.fetchall():
+        zoid = row["zoid"]
+        current_serial = p64(row["tid"])
+        expected = serial_map[zoid]
+        if current_serial != expected:
+            raise ReadConflictError(
+                oid=p64(zoid),
+                serials=(current_serial, expected),
+            )
 
 
 def _batch_write_objects(

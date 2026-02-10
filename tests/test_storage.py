@@ -471,7 +471,10 @@ class TestErrorPaths:
         inst.release()
 
     def test_instance_checkCurrentSerialInTransaction(self, storage, db):
-        """checkCurrentSerialInTransaction raises ReadConflictError on mismatch."""
+        """checkCurrentSerialInTransaction raises ReadConflictError on mismatch.
+
+        Read-conflict checks are deferred to tpc_vote() for batch efficiency.
+        """
         # Store an object first
         conn = db.open()
         root = conn.root()
@@ -484,8 +487,10 @@ class TestErrorPaths:
         t = txn.Transaction()
         inst.tpc_begin(t)
         # Root (oid=0) has a real serial; pass a fake stale serial
+        inst.checkCurrentSerialInTransaction(z64, p64(1), t)
+        # ReadConflictError is raised during tpc_vote (batch check)
         with pytest.raises(ReadConflictError):
-            inst.checkCurrentSerialInTransaction(z64, p64(1), t)
+            inst.tpc_vote(t)
         inst.tpc_abort(t)
         inst.release()
 
