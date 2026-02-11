@@ -39,6 +39,7 @@ import dataclasses
 import logging
 import os
 import psycopg
+import re
 import shutil
 import sys
 import tempfile
@@ -50,21 +51,38 @@ import zope.interface
 logger = logging.getLogger(__name__)
 
 
+_VALID_SQL_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
 @dataclasses.dataclass
 class ExtraColumn:
     """Declares an extra column for object_state written by a state processor.
 
     Attributes:
-        name: PostgreSQL column name.
+        name: PostgreSQL column name (must be a valid SQL identifier:
+            letters, digits, underscores; must start with letter or underscore).
         value_expr: SQL value expression for INSERT, e.g. ``"%(name)s"`` or
             ``"to_tsvector('simple'::regconfig, %(name)s)"``.
         update_expr: Optional ON CONFLICT update expression.  Defaults to
             ``"EXCLUDED.{name}"`` when *None*.
+
+    Security note:
+        State processors are trusted code — ``value_expr`` and ``update_expr``
+        are interpolated into SQL.  Only register processors from sources you
+        trust.  Column names are validated; expressions are not, because they
+        may legitimately contain SQL function calls.
     """
 
     name: str
     value_expr: str
     update_expr: str | None = None
+
+    def __post_init__(self):
+        if not _VALID_SQL_IDENTIFIER.match(self.name):
+            raise ValueError(
+                f"ExtraColumn name must be a valid SQL identifier "
+                f"(letters, digits, underscores), got: {self.name!r}"
+            )
 
 
 # Default cache size: 16 MB per instance (tunable via cache_local_mb parameter)
@@ -215,7 +233,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
         self._serial_cache = {}
 
         # Database connection (schema init + admin queries)
-        logger.debug("Connecting to PostgreSQL: %s", dsn)
+        logger.debug("Connecting to PostgreSQL: %s", _mask_dsn(dsn))
         self._conn = psycopg.connect(dsn, row_factory=dict_row)
         logger.debug("Connected to PostgreSQL")
 
@@ -311,7 +329,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 ddl_conn.execute("SET lock_timeout = '2s'")
                 ddl_conn.execute(sql)
             logger.info("Applied schema DDL from %s", processor_name)
-        except Exception:
+        except psycopg.errors.LockNotAvailable:
             logger.info(
                 "DDL from %s deferred (lock conflict at startup). "
                 "Will apply on first write transaction.",
@@ -916,7 +934,7 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 serial,
                 path,
             )
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, row["data"])
         finally:
@@ -1350,7 +1368,7 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
                 serial,
                 path,
             )
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, row["data"])
         finally:
@@ -1487,6 +1505,14 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
         self.release()
 
 
+_DSN_PASSWORD_RE = re.compile(r"(password\s*=\s*)\S+", re.IGNORECASE)
+
+
+def _mask_dsn(dsn):
+    """Mask password in a PostgreSQL DSN string for safe logging."""
+    return _DSN_PASSWORD_RE.sub(r"\1***", dsn)
+
+
 def _serialize_extension(ext):
     """Serialize transaction extension for BYTEA storage.
 
@@ -1506,7 +1532,15 @@ def _serialize_extension(ext):
             if isinstance(ext_dict, dict) and ext_dict:
                 return json.dumps(ext_dict).encode("utf-8")
             return b""
-        except Exception:
+        except (
+            ImportError,
+            TypeError,
+            KeyError,
+            AttributeError,
+            EOFError,
+            ValueError,
+            OverflowError,
+        ):
             return ext  # fallback: store as-is
     if isinstance(ext, dict):
         if not ext:
@@ -1540,7 +1574,15 @@ def _deserialize_extension(ext_data):
         result = zodb_loads(ext_data)
         if isinstance(result, dict):
             return result
-    except Exception:
+    except (
+        ImportError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        EOFError,
+        ValueError,
+        OverflowError,
+    ):
         pass
     return {}
 
