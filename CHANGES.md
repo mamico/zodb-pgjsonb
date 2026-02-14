@@ -7,8 +7,6 @@
   to share the same REPEATABLE READ snapshot as ZODB loads (e.g. catalog
   queries in plone-pgcatalog).
 
-## 1.0.2
-
 - Security hardening: validate `ExtraColumn.name` against SQL identifier pattern to prevent injection via state processor plugins.
 - Mask credentials in DSN before debug logging (`_mask_dsn()`).
 - Restrict blob file permissions to `0o600` (owner-only, was `0o644`).
