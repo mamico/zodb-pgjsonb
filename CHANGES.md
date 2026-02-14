@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+- Security hardening: validate `ExtraColumn.name` against SQL identifier pattern to prevent injection via state processor plugins.
+- Mask credentials in DSN before debug logging (`_mask_dsn()`).
+- Restrict blob file permissions to `0o600` (owner-only, was `0o644`).
+- Narrow bare `except Exception` blocks to specific exception types.
+
 ## 1.0.1
 
 - Fix `FileNotFoundError` when using blobs with `transaction.savepoint()` (e.g. plone.exportimport content import). Blob files are now staged to a stable location before the caller can delete them. [#1]
