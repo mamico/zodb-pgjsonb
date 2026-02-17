@@ -581,6 +581,11 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
                 blob_threshold=self._blob_threshold,
             )
 
+            # ── State processor finalize hook ────────────────────
+            for proc in self._state_processors:
+                if hasattr(proc, "finalize"):
+                    proc.finalize(cur)
+
         return self._resolved or None
 
     def tpc_finish(self, transaction, f=None):
@@ -1289,6 +1294,11 @@ class PGJsonbStorageInstance(ConflictResolvingStorage):
                 s3_client=self._s3_client,
                 blob_threshold=self._blob_threshold,
             )
+
+            # ── State processor finalize hook ────────────────────
+            for proc in self._main._state_processors:
+                if hasattr(proc, "finalize"):
+                    proc.finalize(cur)
 
         return self._resolved or None
 

@@ -280,3 +280,123 @@ class TestNullSentinelProcessor:
         conn.close()
 
         assert row["cat_path"] is None
+
+
+# ── Finalize hook ──────────────────────────────────────────────────
+
+
+class FinalizeProcessor:
+    """Processor with finalize() hook for testing.
+
+    Records cursor references to verify finalize is called with
+    the same cursor used for batch writes (same PG transaction).
+    """
+
+    finalize_calls: list = []  # noqa: RUF012
+
+    def get_extra_columns(self):
+        return []
+
+    def process(self, zoid, class_mod, class_name, state):
+        return None
+
+    def finalize(self, cursor):
+        self.finalize_calls.append(cursor)
+
+
+class TestFinalizeHook:
+    """Verify finalize(cursor) is called during tpc_vote."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        FinalizeProcessor.finalize_calls = []
+
+    @pytest.fixture
+    def storage_finalize(self, _clean_db):
+        s = PGJsonbStorage(DSN)
+        self.proc = FinalizeProcessor()
+        s.register_state_processor(self.proc)
+        yield s
+        s.close()
+
+    @pytest.fixture
+    def db_finalize(self, storage_finalize):
+        database = ZODB.DB(storage_finalize)
+        # Clear calls from DB initialization (root object creation)
+        self.proc.finalize_calls.clear()
+        yield database
+        database.close()
+
+    def test_finalize_called_during_tpc_vote(self, db_finalize):
+        """finalize() is called once per commit with a live cursor."""
+        conn = db_finalize.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.commit()
+
+        assert len(self.proc.finalize_calls) == 1
+        # The cursor was valid during the call (it's closed after)
+        assert self.proc.finalize_calls[0] is not None
+        conn.close()
+
+    def test_finalize_called_on_each_commit(self, db_finalize):
+        """finalize() is called once per commit, not accumulated."""
+        conn = db_finalize.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.commit()
+        root["x"] = 2
+        txn.commit()
+
+        assert len(self.proc.finalize_calls) == 2
+        conn.close()
+
+    def test_finalize_can_execute_sql(self, db_finalize):
+        """finalize() can execute SQL on the provided cursor."""
+
+        class SQLFinalizeProcessor:
+            def get_extra_columns(self):
+                return []
+
+            def process(self, zoid, class_mod, class_name, state):
+                return None
+
+            def finalize(self, cursor):
+                # Execute a harmless SQL statement
+                cursor.execute("SELECT 1")
+
+        storage = db_finalize.storage
+        storage.register_state_processor(SQLFinalizeProcessor())
+
+        conn = db_finalize.open()
+        root = conn.root()
+        root["y"] = 42
+        txn.commit()  # Should not raise
+        conn.close()
+
+    def test_processor_without_finalize_not_called(self, _clean_db):
+        """Processors without finalize() are silently skipped."""
+        s = PGJsonbStorage(DSN)
+        s.register_state_processor(DummyProcessor())  # no finalize method
+        s._conn.execute(
+            "ALTER TABLE object_state ADD COLUMN IF NOT EXISTS test_label TEXT"
+        )
+        s._conn.commit()
+        db = ZODB.DB(s)
+        conn = db.open()
+        root = conn.root()
+        root["z"] = 1
+        txn.commit()  # Should not raise
+        conn.close()
+        db.close()
+        s.close()
+
+    def test_finalize_not_called_on_abort(self, db_finalize):
+        """finalize() is NOT called when transaction is aborted."""
+        conn = db_finalize.open()
+        root = conn.root()
+        root["x"] = 1
+        txn.abort()
+
+        assert len(self.proc.finalize_calls) == 0
+        conn.close()
