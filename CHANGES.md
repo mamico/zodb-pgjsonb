@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0
+
+- Add `finalize(cursor)` hook to state processor protocol [#5]
+  plone-pgcatalog needs to apply partial JSONB merges (idx || patch) for lightweight reindex operations (e.g. `reindexObjectSecurit`) without full ZODB serialization. The finalize(cursor) hook provides the extension point.
+
 ## 1.1.0
 
 - Added `pg_connection` read-only property to `PGJsonbStorageInstance`,

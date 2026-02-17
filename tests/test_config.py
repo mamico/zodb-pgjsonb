@@ -128,3 +128,64 @@ class TestZConfig:
             pytest.raises(ImportError, match="S3 blob storage requires"),
         ):
             ZODB.config.storageFromString(config_text)
+
+    def test_zconfig_s3_happy_path(self):
+        """ZConfig with S3 config creates storage with S3 client + cache."""
+        import types
+        import unittest.mock
+        import ZODB.config
+
+        _clean_db()
+        config_text = f"""\
+        %import zodb_pgjsonb
+        <pgjsonb>
+            dsn {DSN}
+            s3-bucket-name my-bucket
+            s3-prefix blobs/
+            s3-endpoint-url http://localhost:9000
+            s3-region us-east-1
+            s3-access-key TESTKEY
+            s3-secret-key TESTSECRET
+            s3-use-ssl false
+            blob-cache-dir /tmp/test-blob-cache
+            blob-cache-size 512MB
+        </pgjsonb>
+        """
+        mock_s3_client_cls = unittest.mock.MagicMock()
+        mock_blob_cache_cls = unittest.mock.MagicMock()
+
+        # Create fake modules with the expected classes
+        fake_s3client = types.ModuleType("zodb_s3blobs.s3client")
+        fake_s3client.S3Client = mock_s3_client_cls
+        fake_cache = types.ModuleType("zodb_s3blobs.cache")
+        fake_cache.S3BlobCache = mock_blob_cache_cls
+        fake_pkg = types.ModuleType("zodb_s3blobs")
+
+        import sys
+
+        with unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "zodb_s3blobs": fake_pkg,
+                "zodb_s3blobs.s3client": fake_s3client,
+                "zodb_s3blobs.cache": fake_cache,
+            },
+        ):
+            storage = ZODB.config.storageFromString(config_text)
+            try:
+                assert isinstance(storage, PGJsonbStorage)
+                mock_s3_client_cls.assert_called_once_with(
+                    bucket_name="my-bucket",
+                    prefix="blobs/",
+                    endpoint_url="http://localhost:9000",
+                    region_name="us-east-1",
+                    aws_access_key_id="TESTKEY",
+                    aws_secret_access_key="TESTSECRET",
+                    use_ssl=False,
+                )
+                mock_blob_cache_cls.assert_called_once_with(
+                    cache_dir="/tmp/test-blob-cache",
+                    max_size=512 * 1024 * 1024,
+                )
+            finally:
+                storage.close()
