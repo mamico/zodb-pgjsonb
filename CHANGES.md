@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2
+
+- Fix blob migration: override `copyTransactionsFrom` for blob-aware copying.
+  `BaseStorage.copyTransactionsFrom` only calls `restore()` and silently drops
+  blob data during `zodbconvert` from FileStorage+BlobStorage. The new override
+  detects blobs via `is_blob_record()` and uses `restoreBlob()` to migrate them.
+  Blob files are copied (not moved) to preserve source storage integrity.
+  [mamico, jensens] [#9, #10]
+
 ## 1.2.1
 
 Security review fixes (addresses #7):
