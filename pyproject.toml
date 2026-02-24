@@ -32,6 +32,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/bluedynamics/zodb-pgjsonb"
 Repository = "https://github.com/bluedynamics/zodb-pgjsonb"
+Changelog = "https://github.com/bluedynamics/zodb-pgjsonb/blob/main/CHANGES.md"
 Issues = "https://github.com/bluedynamics/zodb-pgjsonb/issues"
 
 [project.optional-dependencies]
