@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.0
+
+- **Direct JSON string decode path**: Use `decode_zodb_record_for_pg_json()`
+  from zodb-json-codec 1.4.0 — the entire pickle-to-JSON pipeline now runs
+  in Rust with the GIL released. No intermediate Python dicts are created
+  for the store path. 1.3x faster end-to-end on real-world data. [#14]
+
+- **History-preserving optimization**: Changed `object_history` from full
+  dual-write to copy-before-overwrite model — only previous versions are
+  archived before overwrite. Eliminated redundant `blob_history` table.
+  Batch writes up to 33% faster, loadBefore 15% faster, undo 14% faster,
+  ~50% less storage overhead for HP mode. [#13]
+
+- Require `zodb-json-codec>=1.4.0`.
+
 ## 1.2.2
 
 - Fix blob migration: override `copyTransactionsFrom` for blob-aware copying.
