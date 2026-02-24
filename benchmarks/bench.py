@@ -4,6 +4,7 @@ Usage:
     python benchmarks/bench.py storage [--iterations N] [--warmup N]
     python benchmarks/bench.py zodb [--iterations N] [--warmup N]
     python benchmarks/bench.py pack
+    python benchmarks/bench.py history [--iterations N] [--warmup N]
     python benchmarks/bench.py plone [--docs N]
     python benchmarks/bench.py all [--iterations N]
 
@@ -231,6 +232,39 @@ def make_relstorage():
             file=sys.stderr,
         )
         return None
+
+
+def make_pgjsonb_hp():
+    """Create a fresh PGJsonbStorage in history-preserving mode."""
+    from zodb_pgjsonb.storage import PGJsonbStorage
+
+    _clean_pgjsonb_db()
+    return PGJsonbStorage(PGJSONB_DSN, history_preserving=True)
+
+
+def make_relstorage_hp():
+    """Create a fresh RelStorage in history-preserving mode. Returns None if not available."""
+    try:
+        from relstorage.adapters.postgresql import PostgreSQLAdapter
+        from relstorage.options import Options
+        from relstorage.storage import RelStorage
+
+        _clean_relstorage_db()
+        options = Options(keep_history=True)
+        adapter = PostgreSQLAdapter(dsn=RELSTORAGE_DSN, options=options)
+        return RelStorage(adapter, options=options)
+    except Exception as exc:
+        print(
+            f"  {DIM}RelStorage not available: {exc}{RESET}",
+            file=sys.stderr,
+        )
+        return None
+
+
+HP_BACKENDS = [
+    ("PGJsonbStorage", make_pgjsonb_hp),
+    ("RelStorage", make_relstorage_hp),
+]
 
 
 def make_backends() -> list[tuple[str, object]]:
@@ -728,6 +762,404 @@ def run_pack_benchmarks():
 
 
 # ---------------------------------------------------------------------------
+# History-preserving (HP) benchmarks
+# ---------------------------------------------------------------------------
+
+
+def _bench_hp_store_single(storage, iterations, warmup):
+    """Benchmark: single store + 2PC in history-preserving mode."""
+    from ZODB.Connection import TransactionMetaData
+    from ZODB.utils import z64
+
+    data = zodb_pickle(MinPO(1))
+    total = warmup + iterations
+    oids = [storage.new_oid() for _ in range(total)]
+    idx = [0]
+
+    def do_store():
+        oid = oids[idx[0]]
+        idx[0] += 1
+        t = TransactionMetaData()
+        storage.tpc_begin(t)
+        storage.store(oid, z64, data, "", t)
+        storage.tpc_vote(t)
+        storage.tpc_finish(t)
+
+    return bench_one(do_store, iterations=iterations, warmup=warmup)
+
+
+def _bench_hp_store_batch(storage, batch_size, iterations, warmup):
+    """Benchmark: N objects in one transaction (HP mode)."""
+    from ZODB.Connection import TransactionMetaData
+    from ZODB.utils import z64
+
+    data = zodb_pickle(MinPO(1))
+    total = (warmup + iterations) * batch_size
+    oids = [storage.new_oid() for _ in range(total)]
+    idx = [0]
+
+    def do_store_batch():
+        t = TransactionMetaData()
+        storage.tpc_begin(t)
+        for _ in range(batch_size):
+            oid = oids[idx[0]]
+            idx[0] += 1
+            storage.store(oid, z64, data, "", t)
+        storage.tpc_vote(t)
+        storage.tpc_finish(t)
+
+    return bench_one(do_store_batch, iterations=iterations, warmup=warmup)
+
+
+def _bench_hp_loadBefore(storage, iterations, warmup):
+    """Benchmark: loadBefore() — load a historical revision.
+
+    Creates one object with 5 revisions, then repeatedly loads
+    the 2nd revision via loadBefore(oid, tid_of_3rd).
+    This exercises the HP read path (UNION queries in optimized mode).
+    """
+    from ZODB.Connection import TransactionMetaData
+    from ZODB.utils import z64
+
+    oid = storage.new_oid()
+    tids = []
+
+    # Create 5 revisions
+    for i in range(5):
+        data = zodb_pickle(MinPO(i))
+        t = TransactionMetaData()
+        storage.tpc_begin(t)
+        prev = z64 if i == 0 else tids[-1]
+        storage.store(oid, prev, data, "", t)
+        storage.tpc_vote(t)
+        tid = storage.tpc_finish(t)
+        tids.append(tid)
+
+    # loadBefore(oid, tid3) should return revision at tid2
+    target_tid = tids[2]
+
+    def do_loadBefore():
+        storage.loadBefore(oid, target_tid)
+
+    return bench_one(do_loadBefore, iterations=iterations, warmup=warmup)
+
+
+def _bench_hp_history(storage, iterations, warmup):
+    """Benchmark: history() — list revisions of an object.
+
+    Creates one object with 10 revisions, then repeatedly calls
+    history(oid, size=10).  Exercises the UNION + JOIN on transaction_log.
+    """
+    from ZODB.Connection import TransactionMetaData
+    from ZODB.utils import z64
+
+    oid = storage.new_oid()
+    tids = []
+
+    for i in range(10):
+        data = zodb_pickle(MinPO(i))
+        t = TransactionMetaData()
+        storage.tpc_begin(t)
+        prev = z64 if i == 0 else tids[-1]
+        storage.store(oid, prev, data, "", t)
+        storage.tpc_vote(t)
+        tid = storage.tpc_finish(t)
+        tids.append(tid)
+
+    def do_history():
+        storage.history(oid, size=10)
+
+    return bench_one(do_history, iterations=iterations, warmup=warmup)
+
+
+def _bench_hp_load_uncached(storage, iterations, warmup):
+    """Benchmark: cold load from DB in HP mode (cache miss each iteration).
+
+    Same pattern as _bench_load_uncached but with HP storage.
+    Shows whether HP write path affects load() latency.
+    """
+    from ZODB.Connection import TransactionMetaData
+    from ZODB.utils import z64
+
+    total = warmup + iterations
+    data = zodb_pickle(MinPO(42))
+
+    oids = []
+    batch = 100
+    for start in range(0, total, batch):
+        end = min(start + batch, total)
+        t = TransactionMetaData()
+        storage.tpc_begin(t)
+        for _ in range(end - start):
+            oid = storage.new_oid()
+            oids.append(oid)
+            storage.store(oid, z64, data, "", t)
+        storage.tpc_vote(t)
+        storage.tpc_finish(t)
+
+    idx = [0]
+
+    def do_load():
+        storage.load(oids[idx[0]])
+        idx[0] += 1
+
+    return bench_one(do_load, iterations=iterations, warmup=warmup)
+
+
+def run_hp_benchmarks(iterations, warmup):
+    """Run history-preserving storage-level benchmarks."""
+    results = {}
+
+    benchmarks = [
+        ("HP store single", lambda s: _bench_hp_store_single(s, iterations, warmup)),
+        (
+            "HP store batch 10",
+            lambda s: _bench_hp_store_batch(s, 10, iterations, warmup),
+        ),
+        (
+            "HP store batch 100",
+            lambda s: _bench_hp_store_batch(s, 100, max(iterations // 5, 10), warmup),
+        ),
+        ("HP loadBefore", lambda s: _bench_hp_loadBefore(s, iterations, warmup)),
+        ("HP history()", lambda s: _bench_hp_history(s, iterations, warmup)),
+        ("HP load uncached", lambda s: _bench_hp_load_uncached(s, iterations, warmup)),
+    ]
+
+    for bench_name, bench_fn in benchmarks:
+        results[bench_name] = {}
+        for backend_name, make_fn in HP_BACKENDS:
+            storage = make_fn()
+            if storage is None:
+                continue
+            try:
+                print(
+                    f"  {DIM}{bench_name} ({backend_name})...{RESET}",
+                    end="",
+                    flush=True,
+                )
+                stats = bench_fn(storage)
+                results[bench_name][backend_name] = stats
+                print(f" {_fmt_ms(stats.mean)}")
+            except Exception as exc:
+                print(f" ERROR: {exc}")
+            finally:
+                storage.close()
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# History-preserving ZODB-level benchmarks
+# ---------------------------------------------------------------------------
+
+
+def _bench_zodb_write_hp(db, iterations, warmup):
+    """Benchmark: write single object through ZODB.DB in HP mode."""
+    import transaction
+
+    stats = TimingStats()
+    conn = db.open()
+
+    for i in range(warmup):
+        conn.root()[f"warmup_{i}"] = MinPO(i)
+        transaction.commit()
+
+    for i in range(iterations):
+        t0 = time.perf_counter()
+        conn.root()[f"bench_{i}"] = MinPO(i)
+        transaction.commit()
+        t1 = time.perf_counter()
+        stats.samples.append((t1 - t0) * 1000.0)
+
+    conn.close()
+    return stats
+
+
+def _bench_zodb_undo(db, iterations, warmup):
+    """Benchmark: undo a single transaction through ZODB.DB.
+
+    Creates individual objects (each in its own transaction), then
+    undoes them one by one.  Measures the undo + commit round-trip.
+    """
+    import transaction
+
+    conn = db.open()
+    total = warmup + iterations
+
+    # Create objects to undo (each in its own transaction)
+    for i in range(total):
+        conn.root()[f"undo_{i}"] = MinPO(i)
+        transaction.commit()
+
+    # Collect undo IDs (most recent first)
+    undo_log = db.undoLog(0, total)
+    undo_ids = [entry["id"] for entry in undo_log]
+
+    stats = TimingStats()
+
+    # Warmup undos
+    for i in range(warmup):
+        db.undo(undo_ids[i])
+        transaction.commit()
+
+    # Measured undos
+    for i in range(warmup, total):
+        t0 = time.perf_counter()
+        db.undo(undo_ids[i])
+        transaction.commit()
+        t1 = time.perf_counter()
+        stats.samples.append((t1 - t0) * 1000.0)
+
+    conn.close()
+    return stats
+
+
+def run_zodb_hp_benchmarks(iterations, warmup):
+    """Run ZODB-level HP benchmarks."""
+    import ZODB
+
+    results = {}
+
+    benchmarks = [
+        (
+            "HP zodb write",
+            lambda db: _bench_zodb_write_hp(db, iterations, warmup),
+        ),
+        (
+            "HP zodb undo",
+            lambda db: _bench_zodb_undo(db, iterations, warmup),
+        ),
+    ]
+
+    for bench_name, bench_fn in benchmarks:
+        results[bench_name] = {}
+        for backend_name, make_fn in HP_BACKENDS:
+            storage = make_fn()
+            if storage is None:
+                continue
+            db = None
+            try:
+                db = ZODB.DB(storage)
+                print(
+                    f"  {DIM}{bench_name} ({backend_name})...{RESET}",
+                    end="",
+                    flush=True,
+                )
+                stats = bench_fn(db)
+                results[bench_name][backend_name] = stats
+                print(f" {_fmt_ms(stats.mean)}")
+            except Exception as exc:
+                print(f" ERROR: {exc}")
+            finally:
+                if db is not None:
+                    db.close()
+                else:
+                    storage.close()
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# History-preserving pack benchmarks
+# ---------------------------------------------------------------------------
+
+
+def _bench_pack_hp(make_fn, n_objects, pack_iterations=3):
+    """Benchmark HP pack — same as _bench_pack but with history data.
+
+    Creates objects, then modifies each 3 times to generate history rows.
+    Measures pack time including old-revision cleanup.
+    """
+    from persistent.mapping import PersistentMapping
+
+    import transaction
+    import ZODB
+
+    stats = TimingStats()
+    reachable = n_objects // 2
+    garbage = n_objects - reachable
+
+    for _ in range(pack_iterations):
+        storage = make_fn()
+        if storage is None:
+            return None, 0, 0
+
+        db = None
+        try:
+            db = ZODB.DB(storage)
+            conn = db.open()
+            root = conn.root()
+
+            # Create reachable objects
+            for i in range(reachable):
+                root[f"obj_{i}"] = PersistentMapping({"value": i, "rev": 0})
+            transaction.commit()
+
+            # Modify reachable objects 3 times to create history
+            for rev in range(1, 4):
+                for i in range(reachable):
+                    root[f"obj_{i}"]["rev"] = rev
+                transaction.commit()
+
+            # Create garbage objects
+            from ZODB.Connection import TransactionMetaData
+            from ZODB.utils import z64
+
+            data = zodb_pickle(MinPO(999))
+            t = TransactionMetaData()
+            storage.tpc_begin(t)
+            for _ in range(garbage):
+                oid = storage.new_oid()
+                storage.store(oid, z64, data, "", t)
+            storage.tpc_vote(t)
+            storage.tpc_finish(t)
+
+            conn.close()
+
+            # Measure pack
+            t0 = time.perf_counter()
+            db.pack(time.time())
+            t1 = time.perf_counter()
+            stats.samples.append((t1 - t0) * 1000.0)
+        except Exception as exc:
+            print(f" ERROR: {exc}")
+            return None, 0, 0
+        finally:
+            if db is not None:
+                db.close()
+            else:
+                storage.close()
+
+    return stats, reachable, garbage
+
+
+def run_pack_hp_benchmarks():
+    """Run HP pack benchmarks at various sizes (3 iterations each)."""
+    results = {}
+
+    for n_objects in [100, 1000]:
+        results[n_objects] = {}
+        for backend_name, make_fn in HP_BACKENDS:
+            print(
+                f"  {DIM}HP pack {n_objects} ({backend_name})...{RESET}",
+                end="",
+                flush=True,
+            )
+            stats, reachable, garbage = _bench_pack_hp(make_fn, n_objects)
+            if stats is not None and stats.count > 0:
+                results[n_objects][backend_name] = stats
+                print(
+                    f" {_fmt_ms(stats.mean)} +/- {_fmt_ms(stats.stddev)}"
+                    f" ({reachable} reachable x4 revisions, {garbage} garbage,"
+                    f" n={stats.count})"
+                )
+            else:
+                print(" skipped")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Plone benchmarks (subprocess-isolated per backend)
 # ---------------------------------------------------------------------------
 
@@ -1029,6 +1461,122 @@ def print_pack_results(results: dict):
     print()
 
 
+def print_hp_results(results: dict, iterations: int, warmup: int):
+    print(f"\n{HEADER}{'=' * 78}")
+    print(f" HP Storage API ({iterations} iterations, {warmup} warmup)")
+    print(f"{'=' * 78}{RESET}\n")
+
+    has_relstorage = any("RelStorage" in v for v in results.values())
+
+    if has_relstorage:
+        print(
+            f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}"
+        )
+        print(f"  {'-' * 70}")
+    else:
+        print(f"  {'Operation':<24} {'PGJsonb':>12}")
+        print(f"  {'-' * 38}")
+
+    for bench_name, backend_results in results.items():
+        pgjsonb_stats = backend_results.get("PGJsonbStorage")
+        rs_stats = backend_results.get("RelStorage")
+
+        pj_str = _fmt_ms(pgjsonb_stats.mean) if pgjsonb_stats else "N/A"
+
+        if has_relstorage:
+            rs_str = _fmt_ms(rs_stats.mean) if rs_stats else "N/A"
+            cmp_str = (
+                _comparison(pgjsonb_stats.mean, rs_stats.mean)
+                if pgjsonb_stats and rs_stats
+                else ""
+            )
+            print(f"  {bench_name:<24} {pj_str:>12} {rs_str:>12} {cmp_str:>20}")
+        else:
+            print(f"  {bench_name:<24} {pj_str:>12}")
+
+    print()
+
+
+def print_zodb_hp_results(results: dict, iterations: int, warmup: int):
+    print(f"\n{HEADER}{'=' * 78}")
+    print(f" HP ZODB.DB ({iterations} iterations, {warmup} warmup)")
+    print(f"{'=' * 78}{RESET}\n")
+
+    has_relstorage = any("RelStorage" in v for v in results.values())
+
+    if has_relstorage:
+        print(
+            f"  {'Operation':<24} {'PGJsonb':>12} {'RelStorage':>12} {'Comparison':>20}"
+        )
+        print(f"  {'-' * 70}")
+    else:
+        print(f"  {'Operation':<24} {'PGJsonb':>12}")
+        print(f"  {'-' * 38}")
+
+    for bench_name, backend_results in results.items():
+        pgjsonb_stats = backend_results.get("PGJsonbStorage")
+        rs_stats = backend_results.get("RelStorage")
+
+        pj_str = _fmt_ms(pgjsonb_stats.mean) if pgjsonb_stats else "N/A"
+
+        if has_relstorage:
+            rs_str = _fmt_ms(rs_stats.mean) if rs_stats else "N/A"
+            cmp_str = (
+                _comparison(pgjsonb_stats.mean, rs_stats.mean)
+                if pgjsonb_stats and rs_stats
+                else ""
+            )
+            print(f"  {bench_name:<24} {pj_str:>12} {rs_str:>12} {cmp_str:>20}")
+        else:
+            print(f"  {bench_name:<24} {pj_str:>12}")
+
+    print()
+
+
+def print_pack_hp_results(results: dict):
+    print(f"\n{HEADER}{'=' * 78}")
+    print(" HP Pack / GC (3 iterations each, objects x4 revisions)")
+    print(f"{'=' * 78}{RESET}\n")
+
+    has_relstorage = any("RelStorage" in v for v in results.values())
+
+    if has_relstorage:
+        print(
+            f"  {'Objects':<12} {'PGJsonb':>20} {'RelStorage':>20} {'Comparison':>20}"
+        )
+        print(f"  {'-' * 74}")
+    else:
+        print(f"  {'Objects':<12} {'PGJsonb':>20}")
+        print(f"  {'-' * 34}")
+
+    for n_objects, backend_results in results.items():
+        pj_stats = backend_results.get("PGJsonbStorage")
+        rs_stats = backend_results.get("RelStorage")
+
+        pj_str = (
+            f"{_fmt_ms(pj_stats.mean)} +/- {_fmt_ms(pj_stats.stddev)}"
+            if pj_stats is not None
+            else "N/A"
+        )
+
+        if has_relstorage:
+            rs_str = (
+                f"{_fmt_ms(rs_stats.mean)} +/- {_fmt_ms(rs_stats.stddev)}"
+                if rs_stats is not None
+                else "N/A"
+            )
+            cmp_str = (
+                _comparison(pj_stats.mean, rs_stats.mean)
+                if pj_stats is not None and rs_stats is not None
+                else ""
+            )
+            print(f"  {n_objects:<12} {pj_str:>20} {rs_str:>20} {cmp_str:>20}")
+        else:
+            print(f"  {n_objects:<12} {pj_str:>20}")
+
+    print()
+
+
 def print_plone_results(results: dict, n_docs: int):
     print(f"\n{HEADER}{'=' * 78}")
     print(f" Plone Operations ({n_docs} documents)")
@@ -1092,6 +1640,9 @@ def results_to_json(
     plone_results: dict | None,
     iterations: int,
     warmup: int,
+    hp_storage_results: dict | None = None,
+    hp_zodb_results: dict | None = None,
+    hp_pack_results: dict | None = None,
 ) -> dict:
     out: dict = {
         "timestamp": datetime.now(UTC).isoformat(),
@@ -1154,6 +1705,27 @@ def results_to_json(
     if plone_results:
         out["plone"] = plone_results
 
+    if hp_storage_results:
+        out["hp_storage"] = {}
+        for bench_name, backend_results in hp_storage_results.items():
+            out["hp_storage"][bench_name] = {
+                name: stats.to_dict() for name, stats in backend_results.items()
+            }
+
+    if hp_zodb_results:
+        out["hp_zodb"] = {}
+        for bench_name, backend_results in hp_zodb_results.items():
+            out["hp_zodb"][bench_name] = {
+                name: stats.to_dict() for name, stats in backend_results.items()
+            }
+
+    if hp_pack_results:
+        out["hp_pack"] = {}
+        for n_objects, backend_results in hp_pack_results.items():
+            out["hp_pack"][str(n_objects)] = {
+                name: stats.to_dict() for name, stats in backend_results.items()
+            }
+
     return out
 
 
@@ -1181,6 +1753,11 @@ def main() -> None:
     # pack
     sub.add_parser("pack", help="Pack/GC benchmarks")
 
+    # history (HP mode)
+    hp = sub.add_parser("history", help="History-preserving mode benchmarks")
+    hp.add_argument("--iterations", type=int, default=100)
+    hp.add_argument("--warmup", type=int, default=10)
+
     # plone
     pl = sub.add_parser("plone", help="Plone application benchmarks")
     pl.add_argument("--docs", type=int, default=50, help="Number of documents")
@@ -1191,7 +1768,7 @@ def main() -> None:
     al.add_argument("--warmup", type=int, default=10)
     al.add_argument("--docs", type=int, default=50, help="Number of documents (plone)")
 
-    for p in [st, zd, al, pl]:
+    for p in [st, zd, al, pl, hp]:
         p.add_argument("--output", help="Write JSON results to file")
         p.add_argument(
             "--format",
@@ -1234,6 +1811,9 @@ def main() -> None:
     zodb_results = None
     pack_results = None
     plone_results = None
+    hp_storage_results = None
+    hp_zodb_results = None
+    hp_pack_results = None
 
     if args.command in ("storage", "all"):
         print(f"\n{HEADER}Running storage benchmarks...{RESET}")
@@ -1246,6 +1826,16 @@ def main() -> None:
     if args.command in ("pack", "all"):
         print(f"\n{HEADER}Running pack benchmarks...{RESET}")
         pack_results = run_pack_benchmarks()
+
+    if args.command in ("history", "all"):
+        print(f"\n{HEADER}Running HP storage benchmarks...{RESET}")
+        hp_storage_results = run_hp_benchmarks(iterations, warmup)
+
+        print(f"\n{HEADER}Running HP ZODB benchmarks...{RESET}")
+        hp_zodb_results = run_zodb_hp_benchmarks(iterations, warmup)
+
+        print(f"\n{HEADER}Running HP pack benchmarks...{RESET}")
+        hp_pack_results = run_pack_hp_benchmarks()
 
     if args.command in ("plone", "all"):
         print(f"\n{HEADER}Running Plone benchmarks...{RESET}")
@@ -1260,6 +1850,12 @@ def main() -> None:
             print_zodb_results(zodb_results, iterations, warmup)
         if pack_results:
             print_pack_results(pack_results)
+        if hp_storage_results:
+            print_hp_results(hp_storage_results, iterations, warmup)
+        if hp_zodb_results:
+            print_zodb_hp_results(hp_zodb_results, iterations, warmup)
+        if hp_pack_results:
+            print_pack_hp_results(hp_pack_results)
         if plone_results:
             print_plone_results(plone_results, n_docs)
 
@@ -1270,6 +1866,9 @@ def main() -> None:
         plone_results,
         iterations,
         warmup,
+        hp_storage_results=hp_storage_results,
+        hp_zodb_results=hp_zodb_results,
+        hp_pack_results=hp_pack_results,
     )
 
     if fmt in ("json", "both"):
