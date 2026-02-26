@@ -988,11 +988,8 @@ class PGJsonbStorage(ConflictResolvingStorage, BaseStorage):
             self.tpc_finish(txn_info)
             pct_complete = '%1.2f%%' % (txnum * 100.0 / num_txns)
             elapsed = time.time() - begin_time
-            if elapsed:
-                rate = total_size / 1e6 / elapsed
-            else:
-                rate = 0.0
-            rate_str = '%1.3f' % rate
+            rate = total_size / 1000000.0 / elapsed if elapsed else 0.0
+            rate_str = f"{rate:.3f}"
             logger.info("Copied tid %d,%5d records | %6s MB/s (%6d/%6d,%7s)",
                      u64(txn_info.tid), num_txn_records, rate_str,
                      txnum, num_txns, pct_complete)
